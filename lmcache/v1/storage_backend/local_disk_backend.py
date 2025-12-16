@@ -25,6 +25,7 @@ from lmcache.v1.storage_backend.job_executor.pq_executor import (
     AsyncPQThreadPoolExecutor,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.io_uring_helper import IoUringContext, _future_registry
 
 if TYPE_CHECKING:
     # First Party
@@ -132,11 +133,17 @@ class LocalDiskBackend(StorageBackendInterface):
         stat = os.statvfs(self.path)
         self.os_disk_bs = stat.f_bsize
         self.use_odirect = False
+        self.use_uring = False
 
         if config.extra_config is not None:
             self.use_odirect = config.extra_config.get("use_odirect", False)
-        logger.info("Using O_DIRECT for disk I/O: %s", self.use_odirect)
+            self.use_uring = config.extra_config.get("use_uring", False)
 
+        logger.info("Using O_DIRECT for disk I/O: %s", self.use_odirect)
+        logger.info("Using io_uring for disk I/O: %s", self.use_uring)
+
+        if self.use_uring:
+            self.uring = IoUringContext(loop=self.loop, entries=512)
         self.disk_worker = LocalDiskWorker(loop)
 
         # TODO(Jiayi): We need a disk space allocator to avoid fragmentation
@@ -343,6 +350,82 @@ class LocalDiskBackend(StorageBackendInterface):
             self.loop,
         )
 
+    def batched_submit_put_task(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        transfer_spec: Any = None,
+    ) -> None:
+        filtered: List[tuple[CacheEngineKey, MemoryObj]] = []
+        for key, mem in zip(keys, memory_objs, strict=False):
+            if self.exists_in_put_tasks(key):
+                logger.debug(f"Put task for {key} is already in progress.")
+                continue
+            self.disk_worker.insert_put_task(key)
+            filtered.append((key, mem))
+
+        if not filtered:
+            logger.debug("All requested keys were already enqueued; nothing to do.")
+            return
+
+        total_needed = sum(mem.get_physical_size() for _, mem in filtered)
+
+        evicted_keys: List[CacheEngineKey] = []
+        evict_success = True
+
+        with self.disk_lock:
+            while self.current_cache_size + total_needed > self.max_cache_size:
+                # ask the policy for one candidate at a time.
+                # TODO(Ankit): Can we increase the number of candidates?
+                cand = self.cache_policy.get_evict_candidates(self.dict, num_candidates=1)
+                if not cand:
+                    logger.warning(
+                        "No eviction candidates found. Disk space under pressure."
+                    )
+                    evict_success = False
+                    break
+
+                for k in cand:
+                    self.current_cache_size -= self.dict[k].size
+                self.batched_remove(cand, force=False)
+                evicted_keys.extend(cand)
+
+            if evict_success:
+                self.current_cache_size += total_needed
+
+        if not evict_success:
+            logger.error("Unable to make space for the batch. Aborting submission.")
+            return
+
+        for key, mem in filtered:
+            self.cache_policy.update_on_put(key)
+            mem.ref_count_up()
+
+        async def _run_batch() -> None:
+            tasks = [
+                self.disk_worker.submit_task(
+                    "put",
+                    self.async_save_bytes_to_disk,
+                    key=key,
+                    memory_obj=mem,
+                )
+                for key, mem in filtered
+            ]
+
+            await asyncio.gather(*tasks, return_exceptions=False)
+
+        future = asyncio.run_coroutine_threadsafe(_run_batch(), self.loop)
+
+        try:
+            future.result()
+            logger.debug(
+                f"Batch put completed – {len(filtered)} items written "
+                f"and {len(evicted_keys)} keys evicted."
+            )
+        except Exception as exc:
+            logger.exception("Batch put failed: %s", exc)
+
+    """
     # TODO(Jiayi): enable real batching
     def batched_submit_put_task(
         self,
@@ -352,6 +435,7 @@ class LocalDiskBackend(StorageBackendInterface):
     ) -> None:
         for key, memory_obj in zip(keys, memory_objs, strict=False):
             self.submit_put_task(key, memory_obj)
+    """
 
     def get_blocking(
         self,
@@ -472,7 +556,17 @@ class LocalDiskBackend(StorageBackendInterface):
         self.stats_monitor.update_local_storage_usage(self.usage)
 
         # TODO(Jiayi): need to add ref count in disk memory object
-        self.write_file(buffer, path)
+        if self.use_uring:
+            future = asyncio.run_coroutine_threadsafe(
+                self._uring_write(buffer, path), self.loop,
+            )
+
+            try:
+                future.result()
+            except Exception as exc:
+                logger.exception("uring_write failed: %s", exc)
+        else:
+            self.write_file(buffer, path)
 
         # ref count down here because there's a ref_count_up in
         # `submit_put_task` above.
@@ -503,19 +597,53 @@ class LocalDiskBackend(StorageBackendInterface):
         """
 
         logger.debug("Executing `async_load_bytes` from disk.")
-        # TODO (Jiayi): handle the case where loading fails.
-        for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
-            buffer = mem_obj.byte_array
-            self.read_file(key, buffer, path)
 
+        # Build a list of read-coroutines
+        tasks = []
+        async def _run_batch() -> None:
+            if self.use_uring:
+                tasks = [
+                    self._uring_read(key, mem_obj.byte_array, path)
+                    for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False)
+                ]
+                # Await all reads concurrently; any exception aborts the whole batch.
+                await asyncio.gather(*tasks, return_exceptions=False)
+
+        if not self.use_uring:
+            # TODO (Jiayi): handle the case where loading fails.
+            for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
+                buffer = mem_obj.byte_array
+                self.read_file(key, buffer, path)
+
+                # TODO(Jiayi): Please recover the metadata in a more
+                # elegant way in the future.
+                cached_positions = self.dict[key].cached_positions
+                mem_obj.metadata.cached_positions = cached_positions
+
+                with self.disk_lock:
+                    self.dict[key].unpin()
+
+            return memory_objs
+
+        future = asyncio.run_coroutine_threadsafe(_run_batch(), self.loop)
+
+        try:
+            future.result()
+            logger.debug(
+                f"Batch load completed – {len(paths)} items read from disk."
+            )
+        except Exception as exc:
+            logger.exception("Batch load failed: %s", exc)
+            raise
+
+        for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
             # TODO(Jiayi): Please recover the metadata in a more
             # elegant way in the future.
             cached_positions = self.dict[key].cached_positions
             mem_obj.metadata.cached_positions = cached_positions
 
-            self.disk_lock.acquire()
+        with self.disk_lock:
             self.dict[key].unpin()
-            self.disk_lock.release()
 
         return memory_objs
 
@@ -535,7 +663,17 @@ class LocalDiskBackend(StorageBackendInterface):
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
-        self.read_file(key, buffer, path)
+
+        if self.use_uring:
+            future = asyncio.run_coroutine_threadsafe(
+                self._uring_read(key, buffer, path), self.loop,
+            )
+            try:
+                future.result()
+            except Exception as exc:
+                logger.exception("uring_read failed: %s", exc)
+        else:
+            self.read_file(key, buffer, path)
 
         # TODO(Jiayi): Please recover the metadata in a more
         # elegant way in the future.
@@ -590,10 +728,36 @@ class LocalDiskBackend(StorageBackendInterface):
             f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
         )
 
+    async def _uring_write(self, buffer: bytes, path: str) -> None:
+        start_time = time.time()
+        size = len(buffer)
+
+        await self.uring.write(path, buffer, use_odirect=self.use_odirect)
+
+        disk_write_time = time.time() - start_time
+        logger.debug(
+            f"uring Disk write size: {size} bytes, "
+            f"Bandwidth: {size / disk_write_time / 1e6:.2f} MB/s"
+        )
+
+    async def _uring_read(self, key: CacheEngineKey, buffer: bytes, path: str) -> None:
+        start_time = time.time()
+        size = len(buffer)
+
+        await self.uring.read(path, buffer, use_odirect=self.use_odirect)
+
+        disk_read_time = time.time() - start_time
+        logger.debug(
+            f"uring Disk read size: {size} bytes, "
+            f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
+        )
+
     def get_allocator_backend(self):
         return self.local_cpu_backend
 
     def close(self) -> None:
+        if self.use_uring:
+            self.uring.close_all()
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.disk_worker.close()
