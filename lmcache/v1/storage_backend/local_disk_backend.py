@@ -25,6 +25,7 @@ from lmcache.v1.storage_backend.job_executor.pq_executor import (
     AsyncPQThreadPoolExecutor,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.io_uring_helper import UringOp, IoUringBatchEngine
 
 if TYPE_CHECKING:
     # First Party
@@ -132,10 +133,25 @@ class LocalDiskBackend(StorageBackendInterface):
         stat = os.statvfs(self.path)
         self.os_disk_bs = stat.f_bsize
         self.use_odirect = False
+        self.use_uring = False
 
         if config.extra_config is not None:
             self.use_odirect = config.extra_config.get("use_odirect", False)
+            self.use_uring = config.extra_config.get("use_uring", False)
+
+        if self.use_uring:
+            self.ring_size = config.extra_config.get("ring_size")
+            self.max_batch = config.extra_config.get("max_batch")
+            assert self.ring_size is not None
+            assert self.max_batch is not None
+
         logger.info("Using O_DIRECT for disk I/O: %s", self.use_odirect)
+
+        if self.use_uring:
+            logger.info("Using io_uring for disk I/O: %s", self.use_uring)
+            logger.info("io_uring ring size: %d", self.ring_size)
+            logger.info("io_uring max batch submission: %d", self.max_batch)
+            self.uring_engine = IoUringBatchEngine(self.ring_size, self.max_batch)
 
         self.disk_worker = LocalDiskWorker(loop)
 
@@ -350,8 +366,74 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
     ) -> None:
+        """
+        Existing way for non-uring case.
+        """
+        if not self.use_uring:
+            for key, memory_obj in zip(keys, memory_objs, strict=False):
+                self.submit_put_task(key, memory_obj)
+            return
+
+        # uring case
+        ops = []
+        total = 0
+
+        def make_cb(key, memory_obj):
+            def cb(res):
+                if res < 0:
+                    logger.error("uring command failed: %s", key)
+                else:
+                    self.insert_key(
+                        key,
+                        memory_obj.get_physical_size(),
+                        memory_obj.metadata.shape,
+                        memory_obj.metadata.dtype,
+                        memory_obj.metadata.fmt,
+                        cached_positions=memory_obj.metadata.cached_positions,
+                    )
+
+                logger.debug("uring write completed: %s", key)
+                self.disk_worker.remove_put_task(key)
+                memory_obj.ref_count_down()
+
+            return cb
+
         for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(key, memory_obj)
+            if self.exists_in_put_tasks(key):
+                continue
+
+            required_size = memory_obj.get_physical_size()
+            with self.disk_lock:
+                while self.current_cache_size + required_size > self.max_cache_size:
+                    evict_keys = self.cache_policy.get_evict_candidates(self.dict, num_candidates=1)
+                    if not evict_keys:
+                        return
+                    for k in evict_keys:
+                        self.current_cache_size -= self.dict[k].size
+                    self.batched_remove(cand, force=False)
+
+                self.current_cache_size += required_size
+
+            self.cache_policy.update_on_put(key)
+            self.disk_worker.insert_put_task(key)
+            memory_obj.ref_count_up()
+
+            path = self._key_to_path(key)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+
+            buf = memory_obj.byte_array
+
+            size = len(buf)
+            ops.append(
+                UringOp("write", fd, buf, size, make_cb(key, memory_obj))
+            )
+
+        total = len(ops)
+        if total == 0:
+           return
+
+        for op in ops:
+            self.uring_engine.submit(op)
 
     def get_blocking(
         self,
@@ -427,13 +509,22 @@ class LocalDiskBackend(StorageBackendInterface):
             mem_objs.append(memory_obj)
             paths.append(path)
 
-        return await self.disk_worker.submit_task(
-            "prefetch",
-            self.batched_async_load_bytes_from_disk,
-            paths=paths,
-            keys=keys,
-            memory_objs=mem_objs,
-        )
+        if self.use_uring:
+            return await self.disk_worker.submit_task(
+                "prefetch",
+                self.batched_async_load_bytes_from_disk_uring,
+                paths=paths,
+                keys=keys,
+                memory_objs=mem_objs,
+            )
+        else:
+            return await self.disk_worker.submit_task(
+                "prefetch",
+                self.batched_async_load_bytes_from_disk,
+                paths=paths,
+                keys=keys,
+                memory_objs=mem_objs,
+            )
 
     async def batched_async_contains(
         self,
@@ -491,6 +582,53 @@ class LocalDiskBackend(StorageBackendInterface):
 
         self.disk_worker.remove_put_task(key)
 
+    def batched_async_load_bytes_from_disk_uring(
+        self,
+        paths: list[str],
+        keys: list[CacheEngineKey],
+        memory_objs: list[MemoryObj],
+        write_back: bool = False,
+    ) -> list[MemoryObj]:
+        """
+        Async load bytearray from disk with iouring.
+        """
+        logger.debug("Executing io_uring based batched async load from disk.")
+
+        def make_cb(key: CacheEngineKey, mem_obj: MemoryObj):
+            def _cb(res: int) -> None:
+                if res < 0:
+                    logger.error("uring read failed for %s: %s", key, os.strerror(-res))
+                else:
+                    cached_positions = self.dict[key].cached_positions
+                    mem_obj.metadata.cached_positions = cached_positions
+                    logger.debug("uring read completed for %s", key)
+
+                with self.disk_lock:
+                    self.dict[key].unpin()
+            return _cb
+
+        futures: list[Future] = []
+        for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
+            fd = os.open(path, os.O_RDONLY)
+            buf = mem_obj.byte_array
+            size = len(buf)
+
+            cb = make_cb(key, mem_obj)
+            op = UringOp(op="read", fd=fd, buf=buf, size=size, cb=cb)
+            self.uring_engine.submit(op)
+
+            fut = Future()
+            def _store_res(res: int, f=fut):
+                f.set_result(res)
+            op.cb = lambda r, f=_store_res: f(r)
+            futures.append(fut)
+
+        # Wait for the whole batch to finish
+        for fut in futures:
+            fut.result()
+
+        return memory_objs
+
     def batched_async_load_bytes_from_disk(
         self,
         paths: list[str],
@@ -535,7 +673,13 @@ class LocalDiskBackend(StorageBackendInterface):
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
-        self.read_file(key, buffer, path)
+        if self.use_uring:
+            fut = self._submit_read_via_uring(key, path, buffer)
+            res = fut.result()
+            if res < 0:
+                return None
+        else:
+            self.read_file(key, buffer, path)
 
         # TODO(Jiayi): Please recover the metadata in a more
         # elegant way in the future.
@@ -543,6 +687,28 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_obj.metadata.cached_positions = cached_positions
 
         return memory_obj
+
+    def _submit_read_via_uring(
+        self,
+        key: CacheEngineKey,
+        path: str,
+        buffer: memoryview,
+    ) -> Future:
+        fut = Future()
+
+        def cb(res: int) -> None:
+            if res < 0:
+                logger.error("io_uring read failed for %s: %s", key, os.strerror(-res))
+            else:
+                logger.debug("io_uring read completed")
+                pass
+            fut.set_result(res)
+
+        fd = os.open(path, os.O_RDONLY)
+
+        op = UringOp(op="read", fd=fd, buf=buffer, size=buffer.nbytes, cb=cb)
+        self.uring_engine.submit(op)
+        return fut
 
     def write_file(self, buffer, path):
         start_time = time.time()
@@ -594,6 +760,8 @@ class LocalDiskBackend(StorageBackendInterface):
         return self.local_cpu_backend
 
     def close(self) -> None:
+        if self.use_uring:
+            self.uring.close_all()
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.disk_worker.close()
