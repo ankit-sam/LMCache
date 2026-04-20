@@ -30,6 +30,73 @@ use std::time::Duration;
 use io_uring::types::Fd;
 use io_uring::{opcode, IoUring};
 
+// NVMe identify namespace data structure
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct NvmeIdNs {
+    nsze: u64,
+    ncap: u64,
+    nuse: u64,
+    nsfeat: u8,
+    nlbaf: u8,
+    flbas: u8,
+    mc: u8,
+    dpc: u8,
+    dps: u8,
+    nmic: u8,
+    rescap: u8,
+    fpi: u8,
+    dlfeat: u8,
+    nawun: u16,
+    nawupf: u16,
+    nacwu: u16,
+    nabsn: u16,
+    nabo: u16,
+    nabspf: u16,
+    noiob: u16,
+    nvmcap: [u8; 16],
+    npwg: u16,
+    npwa: u16,
+    npdg: u16,
+    npda: u16,
+    nows: u16,
+    mssrl: u16,
+    mcl: u32,
+    msrc: u8,
+    rsvd81: [u8; 11],
+    anagrpid: u32,
+    rsvd96: [u8; 3],
+    nsattr: u8,
+    nvmsetid: u16,
+    endgid: u16,
+    nguid: [u8; 16],
+    eui64: [u8; 8],
+    lbaf: [NvmeLbaf; 64],
+    vs: [u8; 3712],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct NvmeLbaf {
+    ms: u16,
+    ds: u8,
+    rp: u8,
+}
+
+// NVMe admin opcodes
+const NVME_ADMIN_IDENTIFY: u8 = 0x06;
+
+// NVMe identify CNS values
+const NVME_IDENTIFY_CNS_NS: u32 = 0x00;
+
+// Linux ioctl for NVMe admin command
+// Defined in <linux/nvme_ioctl.h>: NVME_IOCTL_ADMIN_CMD _IOWR ('N', 0x41)
+const NVME_IOCTL_ADMIN_CMD: libc::c_ulong = 0xC048_4E41;
+
+// Linux ioctl for NVMe namespace ID
+// Defined in <linux/nvme_ioctl.h>: NVME_IOCTL_ID _IO ('N', 0x40)
+const NVME_IOCTL_ID: libc::c_ulong = 0x4e40;
+
 // Linux ioctl for block device size in bytes.
 // Defined in <linux/fs.h>: BLKGETSIZE64 _IOR(0x12,114,size_t)
 const BLKGETSIZE64: libc::c_ulong = 0x8008_1272; // ioctl op to query block size
@@ -149,6 +216,124 @@ fn fd_size_bytes(fd: RawFd) -> Result<u64, PyErr> {
         return Err(os_err("fstat failed"));
     }
     Ok(st.st_size as u64)
+}
+
+// NVMe helper functions for io_uring command support
+
+// Calculate NVMe namespace size in bytes from identify namespace data
+fn nvme_ns_size_bytes(id_ns: &NvmeIdNs, lba_size: u32) -> u64 {
+    id_ns.nsze * lba_size as u64
+}
+
+/// Check if device path is a character device (e.g., /dev/ng0n1)
+fn is_character_device(path: &str) -> Result<bool, PyErr> {
+    let cpath = CString::new(path).map_err(|_| PyValueError::new_err("path contains NUL"))?;
+
+    // SAFETY: stat call
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::stat(cpath.as_ptr(), &mut st as *mut libc::stat) };
+
+    if rc != 0 {
+        return Err(os_err("stat failed"));
+    }
+
+    Ok((st.st_mode & libc::S_IFMT) == libc::S_IFCHR)
+}
+
+/// Get namespace ID from NVMe device using ioctl.
+fn nvme_get_nsid_from_fd(fd: RawFd) -> Result<u32, PyErr> {
+    //SAFETY: ioctl call with request that returns an integer
+    let ret = unsafe { libc::ioctl(fd, NVME_IOCTL_ID) };
+    if ret < 0 {
+        return Err(os_err("Failed to get namespace ID via ioctl"));
+    }
+    Ok(ret as u32)
+}
+
+/// Get LBA shift (log2 of LBA size) from identify namespace data
+fn nvme_get_lba_shift(id_ns: &NvmeIdNs) -> Result<u32, PyErr> {
+    // Extract LBA format index from FLBAS
+
+    let lbaf_index = if id_ns.flbas < 16 {
+        (id_ns.flbas & 0x0F) as usize
+    } else {
+        let lsb = (id_ns.flbas & 0x0F) as usize;
+        let msb = ((id_ns.flbas >> 5) & 0x03) as usize;
+        lsb + (msb << 4)
+    };
+
+    if lbaf_index >= 64 {
+        return Err(PyValueError::new_err("Invalid LBA format index"));
+    }
+
+    // Get LBA data size from LBAF
+    let ds = id_ns.lbaf[lbaf_index].ds;
+    if ds == 0 {
+        return Err(PyValueError::new_err("Invalid LBA data size"));
+    }
+
+    // Check for metadata support
+    let ms = id_ns.lbaf[lbaf_index].ms;
+    if ms != 0 {
+        return Err(PyValueError::new_err(
+            "Device is formatted with metadata, can't be supported.",
+        ));
+    }
+
+    Ok(ds as u32)
+}
+
+/// Get LBA size in bytes from identify namespace data
+fn nvme_get_lba_size(id_ns: &NvmeIdNs) -> Result<u32, PyErr> {
+    let lba_shift = nvme_get_lba_shift(id_ns)?;
+    Ok(1u32 << lba_shift)
+}
+
+/// NVMe passthrough command structure for ioctl
+#[repr(C)]
+struct NvmePassthruCmd {
+    opcode: u8,
+    flags: u8,
+    rsvd1: u16,
+    nsid: u32,
+    cdw2: u32,
+    cdw3: u32,
+    metadata: u64,
+    addr: u64,
+    metadata_len: u32,
+    data_len: u32,
+    cdw10: u32,
+    cdw11: u32,
+    cdw12: u32,
+    cdw13: u32,
+    cdw14: u32,
+    cdw15: u32,
+    timeout_ms: u32,
+    result: u32,
+}
+
+/// Send NVMe identify namespace command via ioctl
+fn nvme_identify_ns(fd: RawFd, nsid: u32) -> Result<NvmeIdNs, PyErr> {
+    let mut id_ns: NvmeIdNs = unsafe { std::mem::zeroed() };
+
+    let cmd = NvmePassthruCmd {
+        opcode: NVME_ADMIN_IDENTIFY,
+        nsid,
+        addr: &mut id_ns as *mut NvmeIdNs as u64,
+        data_len: std::mem::size_of::<NvmeIdNs>() as u32,
+        cdw10: NVME_IDENTIFY_CNS_NS,
+        timeout_ms: 0,
+        ..unsafe { std::mem::zeroed() }
+    };
+
+    // SAFETY: ioctl with properly initialized command structure
+    let rc = unsafe { libc::ioctl(fd, NVME_IOCTL_ADMIN_CMD, &cmd as *const NvmePassthruCmd) };
+
+    if rc < 0 {
+        return Err(os_err("NVMe identify namespace ioctl failed"));
+    }
+
+    Ok(id_ns)
 }
 
 /// Aligned buffer for O_DIRECT I/O.
@@ -347,6 +532,10 @@ struct RawBlockDevice {
     use_odirect: bool,  // enforce alignment + bypass page cache
     alignment: usize,   // required alignment in bytes
     use_iouring: bool,  // Enable io_uring
+    // NVMe device data (only when use_uring_cmd=true)
+    nvme_nsid: Option<u32>,      // Namespace ID
+    nvme_lba_shift: Option<u32>, // LBA shift (log2 of LBA size)
+    nvme_lba_size: Option<u32>,  // LBA size in bytes
     // io_uring ring instance (only when use_iouring=true)
     ring: Option<Arc<Mutex<IoUring>>>,
     // Queue for sending I/O requests from Python to worker thread
@@ -389,8 +578,10 @@ impl RawBlockDevice {
         use_odirect: bool,
         alignment: usize,
         use_iouring: bool,
+        use_uring_cmd: bool,
     ) -> PyResult<Self> {
-        let cpath = CString::new(path).map_err(|_| PyValueError::new_err("path contains NUL"))?;
+        let cpath =
+            CString::new(path.clone()).map_err(|_| PyValueError::new_err("path contains NUL"))?;
         let mut flags = if writable {
             libc::O_RDWR
         } else {
@@ -404,8 +595,44 @@ impl RawBlockDevice {
         if fd < 0 {
             return Err(os_err("open failed"));
         }
-        let size = fd_size_bytes(fd)?;
 
+        // Initialize NVMe data if io_uring command support is enabled
+        let (nvme_nsid, nvme_lba_shift, nvme_lba_size, nvme_id_ns) = if use_uring_cmd {
+            // Validate that device is a character device (required for io_uring_cmd)
+            let is_char_dev = is_character_device(&path)?;
+            if !is_char_dev {
+                return Err(PyValueError::new_err(
+                    "io_uring_cmd requires a NVMe namespace character device (e.g., /dev/ng0n1)",
+                ));
+            }
+
+            // Get namespace ID from device path
+            let nsid = nvme_get_nsid_from_fd(fd)?;
+            println!("nsid = {}", nsid);
+            // Send identify namespace command to get LBA size
+            let id_ns = nvme_identify_ns(fd, nsid)?;
+            let lba_shift = nvme_get_lba_shift(&id_ns)?;
+            let lba_size = nvme_get_lba_size(&id_ns)?;
+            println!("lba_shift = {}, lba_size = {}", lba_shift, lba_size);
+
+            (Some(nsid), Some(lba_shift), Some(lba_size), Some(id_ns))
+        } else {
+            (None, None, None, None)
+        };
+
+        // Calculate device size. Use NVMe ns info for character device
+        // Use ioctl/fstat for block devices and regular files
+        let size = if use_uring_cmd {
+            if let (Some(id_ns), Some(lba_size)) = (nvme_id_ns, nvme_lba_size) {
+                nvme_ns_size_bytes(&id_ns, lba_size)
+            } else {
+                0
+            }
+        } else {
+            fd_size_bytes(fd)?
+        };
+
+        println!("size = {}", size as u64);
         let (
             ring_opt,
             queue_opt,
@@ -924,6 +1151,9 @@ impl RawBlockDevice {
             use_odirect,
             alignment,
             use_iouring,
+            nvme_nsid,
+            nvme_lba_shift,
+            nvme_lba_size,
             ring: ring_opt,
             queue: queue_opt,
             worker: worker_opt,
@@ -948,21 +1178,50 @@ impl RawBlockDevice {
 impl RawBlockDevice {
     #[new]
     #[pyo3(
-        signature = (path, writable, use_odirect = false, use_iouring = false, alignment = 4096)
+        signature = (path, writable, use_odirect = false, use_iouring = false, use_uring_cmd = false, alignment = 4096)
     )]
     fn new(
         path: String,
         writable: bool,
         use_odirect: bool,
         use_iouring: bool,
+        use_uring_cmd: bool,
         alignment: usize,
     ) -> PyResult<Self> {
-        Self::new_internal(path, writable, use_odirect, alignment, use_iouring)
+        Self::new_internal(
+            path,
+            writable,
+            use_odirect,
+            alignment,
+            use_iouring,
+            use_uring_cmd,
+        )
     }
 
     // Expose cached size to Python.
     fn size_bytes(&self) -> PyResult<u64> {
         Ok(self.size)
+    }
+
+    /// Get NVMe namespace ID (only available when use_uring_cmd=true)
+    fn nvme_nsid(&self) -> PyResult<u32> {
+        self.nvme_nsid.ok_or_else(|| {
+            PyRuntimeError::new_err("NVMe namespace ID not available (use_uring_cmd not enabled)")
+        })
+    }
+
+    /// Get NVMe LBA shift (log2 of LBA size, only available when use_uring_cmd=true)
+    fn nvme_lba_shift(&self) -> PyResult<u32> {
+        self.nvme_lba_shift.ok_or_else(|| {
+            PyRuntimeError::new_err("NVMe LBA shift not available (use_uring_cmd not enabled)")
+        })
+    }
+
+    /// Get NVMe LBA size in bytes (only available when use_uring_cmd=true)
+    fn nvme_lba_size(&self) -> PyResult<u32> {
+        self.nvme_lba_size.ok_or_else(|| {
+            PyRuntimeError::new_err("NVMe LBA size not available (use_uring_cmd not enabled)")
+        })
     }
 
     /// Register fixed buffers for zero-copy io_uring operations.

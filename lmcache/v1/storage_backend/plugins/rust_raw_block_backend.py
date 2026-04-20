@@ -180,6 +180,11 @@ class RustRawBlockBackend(StoragePluginInterface):
             extra.get("rust_raw_block.enable_zero_copy", True)
         )
         self.use_uring: bool = bool(extra.get("rust_raw_block.use_uring", False))
+        # io_uring command (passthrough) support. When enabled, NVMe passthrough
+        # commands will be embedded inside io_uring submission queue entry.
+        self.use_uring_cmd: bool = bool(
+            extra.get("rust_raw_block.use_uring_cmd", False)
+        )
 
         # On-device metadata region config.
         self.meta_total_bytes: int = int(
@@ -369,6 +374,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                 use_odirect=self.use_odirect,
                 alignment=self.block_align,
                 use_iouring=self.use_uring,
+                use_uring_cmd=self.use_uring_cmd,
             )
         return self._raw
 
