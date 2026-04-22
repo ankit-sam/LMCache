@@ -95,6 +95,9 @@ const NVME_IDENTIFY_CNS_NS: u32 = 0x00;
 const NVME_IO_READ: u8 = 0x02;
 const NVME_IO_WRITE: u8 = 0x01;
 
+// NVMe I/O management opcodes
+const NVME_IO_MGMT_RECV: u8 = 0x12;
+
 // NVMe uring command structure (80 bytes)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +124,9 @@ struct NvmeUringCmd {
 // Linux ioctl for NVMe admin command
 // Defined in <linux/nvme_ioctl.h>: NVME_IOCTL_ADMIN_CMD _IOWR ('N', 0x41)
 const NVME_IOCTL_ADMIN_CMD: libc::c_ulong = 0xC048_4E41;
+
+// Defined in <linux/nvme_ioctl.h>: NVME_IOCTL_IO_CMD _IOWR ('N', 0x43)
+const NVME_IOCTL_IO_CMD: libc::c_ulong = 0xC048_4E43;
 
 // NVMe io_uring_cmd opcodes
 const NVME_URING_CMD_IO: u32 = 0xC048_4E80;
@@ -344,6 +350,26 @@ struct NvmePassthruCmd {
     result: u32,
 }
 
+// NVMe FDP (Flexible Data Placement) reclaim unit handle status descriptor
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct NvmeFdpRuhStatusDesc {
+    pid: u16,    // Placement Identifier
+    ruhid: u16,  // Reclaim Unit Handle ID
+    earutr: u32, // Estimated Available Reclaim Unit Throughput
+    ruamw: u64,  // Reclaim Unit Available Media Writes
+    rsvd16: [u8; 16],
+}
+
+// NVMe FDP reclaim unit handle status
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct NvmeFdpRuhStatus {
+    rsvd0: [u8; 14],
+    nruhsd: u16, // Number of Reclaim Unit Handle Status Descriptors
+                 // Followed by variable length array of NvmeFdpRuhStatusDesc
+}
+
 /// Send NVMe identify namespace command via ioctl
 fn nvme_identify_ns(fd: RawFd, nsid: u32) -> Result<NvmeIdNs, PyErr> {
     let mut id_ns: NvmeIdNs = unsafe { std::mem::zeroed() };
@@ -368,7 +394,73 @@ fn nvme_identify_ns(fd: RawFd, nsid: u32) -> Result<NvmeIdNs, PyErr> {
     Ok(id_ns)
 }
 
+/// Send NVMe I/O management receive command to get reclaim unit handle status
+fn nvme_fdp_reclaim_unit_handle_status(
+    fd: RawFd,
+    nsid: u32,
+    data_len: u32,
+    data: *mut u8,
+) -> Result<(), PyErr> {
+    let cmd = NvmePassthruCmd {
+        opcode: NVME_IO_MGMT_RECV,
+        nsid,
+        addr: data as u64,
+        data_len,
+        cdw10: 1,                   // MO = 1 for Reclaim Unit Handle Status
+        cdw11: (data_len >> 2) - 1, // NUMD (number of dwords)
+        timeout_ms: 0,
+        result: 0,
+        ..unsafe { std::mem::zeroed() }
+    };
+
+    // SAFETY: ioctl with properly initialized command structure
+    let rc = unsafe { libc::ioctl(fd, NVME_IOCTL_IO_CMD, &cmd as *const NvmePassthruCmd) };
+
+    if rc < 0 {
+        return Err(os_err("NVMe FDP reclaim unit handle status ioctl failed"));
+    }
+
+    Ok(())
+}
+
+/// Fetch all available reclaim unit handles (RUH) for the NVMe device
+///
+/// Returns a vector of placement identifiers (PIDs) for all available reclaim units
+fn fetch_ruhs(fd: RawFd, nsid: u32, max_ruhs: u16) -> Result<Vec<u16>, PyErr> {
+    // Calculate buffer size needed
+    let header_size = std::mem::size_of::<NvmeFdpRuhStatus>();
+    let desc_size = std::mem::size_of::<NvmeFdpRuhStatusDesc>();
+    let bytes = header_size + (max_ruhs as usize) * desc_size;
+
+    // Allocate buffer for RUH status
+    let mut buffer: Vec<u8> = vec![0; bytes];
+    let ruhs_ptr = buffer.as_mut_ptr() as *mut NvmeFdpRuhStatus;
+
+    // Send I/O management receive command
+    nvme_fdp_reclaim_unit_handle_status(fd, nsid, bytes as u32, buffer.as_mut_ptr())?;
+
+    // Read the number of RUH descriptors returned
+    let nruhsd = unsafe { u16::from_le((*ruhs_ptr).nruhsd) };
+    let actual_ruhs = std::cmp::min(nruhsd, max_ruhs) as usize;
+
+    // Extract placement identifiers from each descriptor
+    let mut plis: Vec<u16> = Vec::with_capacity(actual_ruhs);
+    let desc_array = unsafe {
+        std::slice::from_raw_parts(
+            (ruhs_ptr as *const u8).add(header_size) as *const NvmeFdpRuhStatusDesc,
+            actual_ruhs,
+        )
+    };
+
+    for desc in desc_array {
+        plis.push(u16::from_le(desc.pid));
+    }
+
+    Ok(plis)
+}
+
 /// Prepare NVMe uring command for read/write operations
+#[allow(clippy::too_many_arguments)]
 fn nvme_uring_cmd_prep(
     cmd: &mut NvmeUringCmd,
     is_write: bool,
@@ -377,6 +469,8 @@ fn nvme_uring_cmd_prep(
     len: usize,
     lba_shift: u32,
     ptr: *const u8,
+    dtype: u8,
+    dspec: u16,
 ) -> Result<(), PyErr> {
     // Calculate SLBA (Starting LBA) and NLB (Number of LBAs)
     let slba = offset >> lba_shift;
@@ -394,8 +488,11 @@ fn nvme_uring_cmd_prep(
     cmd.cdw10 = (slba & 0xFFFFFFFF) as u32;
     cmd.cdw11 = (slba >> 32) as u32;
 
-    // Set NLB in cdw12 (bits 0-15)
-    cmd.cdw12 = nlb as u32;
+    // Set NLB in cdw12 (bits 0-15) and dtype in bits 20-23
+    cmd.cdw12 = nlb as u32 | ((dtype as u32) << 20);
+
+    // Set dspec in cdw13 bits 16-31
+    cmd.cdw13 = (dspec as u32) << 16;
 
     // Set data address and length
     cmd.addr = ptr as u64;
@@ -549,6 +646,8 @@ impl IoCompletion {
 struct NvmeCmdData {
     nsid: u32,      // Namespace ID
     lba_shift: u32, // LBA shift (log2 of LBA size)
+    dtype: u8,      // Data type for FDP (2=FDP)
+    dspec: u16,     // Data specifier (placement ID) for FDP
 }
 
 /// Represents a single I/O submission to io_uring.
@@ -1002,6 +1101,8 @@ impl RawBlockDevice {
                                     sub.len,
                                     nvme_data.lba_shift,
                                     ptr,
+                                    nvme_data.dtype,
+                                    nvme_data.dspec,
                                 )
                                 .expect("Failed to prepare NVMe uring command");
 
@@ -1377,6 +1478,36 @@ impl RawBlockDevice {
         })
     }
 
+    /// Fetch all available reclaim unit handles (RUH) for the NVMe device
+    ///
+    /// This function sends an NVMe I/O Management Receive command to retrieve
+    /// the status of all reclaim unit handles. It returns a list of placement
+    /// identifiers (PIDs) that can be used for FDP (Flexible Data Placement)
+    /// operations.
+    ///
+    /// Args:
+    ///     max_ruhs: Maximum number of reclaim unit handles to fetch (default: 256)
+    ///
+    /// Returns:
+    ///     A list of placement identifiers (u16) for each available reclaim unit
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If use_uring_cmd is not enabled or the command fails
+    #[pyo3(signature = (max_ruhs = 256))]
+    fn fetch_reclaim_unit_handles(&self, max_ruhs: u16) -> PyResult<Vec<u16>> {
+        if !self.use_uring_cmd {
+            return Err(PyRuntimeError::new_err(
+                "fetch_reclaim_unit_handles requires use_uring_cmd to be enabled",
+            ));
+        }
+
+        let nsid = self
+            .nvme_nsid
+            .ok_or_else(|| PyRuntimeError::new_err("NVMe namespace ID not available"))?;
+
+        fetch_ruhs(self.fd, nsid, max_ruhs)
+    }
+
     /// Register fixed buffers for zero-copy io_uring operations.
     ///
     /// - Pre-registering memory buffers with the kernel
@@ -1449,13 +1580,14 @@ impl RawBlockDevice {
     ///
     /// Returns a batch_id that must be passed to wait_iouring() to wait
     /// for completions for that batch.
-    #[pyo3(signature = (offsets, buffers, total_lens))]
+    #[pyo3(signature = (offsets, buffers, total_lens, placement_ids = None))]
     fn batched_write(
         &self,
         py: Python<'_>,
         offsets: Vec<u64>,
         buffers: Vec<Bound<'_, PyAny>>,
         total_lens: Vec<usize>,
+        placement_ids: Option<Vec<i32>>,
     ) -> PyResult<u64> {
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
@@ -1471,6 +1603,14 @@ impl RawBlockDevice {
         }
         if buffers.len() != n || total_lens.len() != n {
             return Err(PyValueError::new_err("All vectors must have same length"));
+        }
+
+        if let Some(ref pids) = placement_ids {
+            if pids.len() != n {
+                return Err(PyValueError::new_err(
+                    "placement_ids must have same length as other vectors",
+                ));
+            }
         }
 
         // Acquire buffer views to keep them alive until wait_iouring() completes
@@ -1530,16 +1670,14 @@ impl RawBlockDevice {
         } else {
             HashMap::new()
         };
-        // Get NVMe data for io_uring_cmd
-        let nvme_cmd_data = if use_uring_cmd {
-            Some(NvmeCmdData {
-                nsid: self
-                    .nvme_nsid
+
+        let nvme_cmd_data_base = if use_uring_cmd {
+            Some((
+                self.nvme_nsid
                     .ok_or_else(|| PyRuntimeError::new_err("NVMe namespace ID not available"))?,
-                lba_shift: self
-                    .nvme_lba_shift
+                self.nvme_lba_shift
                     .ok_or_else(|| PyRuntimeError::new_err("NVMe LBA shift not available"))?,
-            })
+            ))
         } else {
             None
         };
@@ -1562,6 +1700,14 @@ impl RawBlockDevice {
                 let ptr = ptrs[i] as *const u8;
                 let total_len = total_lens[i];
                 let offset = offsets[i];
+
+                // Get placement ID for this write (negative or None means no FDP)
+                let placement_id = placement_ids
+                    .as_ref()
+                    .and_then(|pids| pids.get(i))
+                    .copied()
+                    .filter(|&pid| pid >= 0)
+                    .map(|pid| pid as u16);
 
                 let comp = Arc::new(IoCompletion::new());
 
@@ -1591,6 +1737,18 @@ impl RawBlockDevice {
                     (ptr, None, fixed_idx)
                 };
 
+                // Build NVMe command data with placement ID if provided
+                let nvme_cmd_data = if let Some((nsid, lba_shift)) = nvme_cmd_data_base {
+                    Some(NvmeCmdData {
+                        nsid,
+                        lba_shift,
+                        dtype: 0x2,
+                        dspec: placement_id.unwrap_or(0),
+                    })
+                } else {
+                    None
+                };
+
                 let sub = IoSubmission {
                     fd,
                     offset,
@@ -1603,7 +1761,7 @@ impl RawBlockDevice {
                     original_ptr: None,
                     payload_len: None,
                     batch_id,
-                    nvme_cmd_data: nvme_cmd_data.clone(),
+                    nvme_cmd_data,
                 };
 
                 submissions.push((sub, comp));
@@ -1846,6 +2004,8 @@ impl RawBlockDevice {
                         lba_shift: self.nvme_lba_shift.ok_or_else(|| {
                             PyRuntimeError::new_err("NVMe LBA shift not available")
                         })?,
+                        dtype: 0,
+                        dspec: 0,
                     })
                 } else {
                     None
@@ -1886,6 +2046,8 @@ impl RawBlockDevice {
                         lba_shift: self.nvme_lba_shift.ok_or_else(|| {
                             PyRuntimeError::new_err("NVMe LBA shift not available")
                         })?,
+                        dtype: 0,
+                        dspec: 0,
                     })
                 } else {
                     None
@@ -1908,7 +2070,7 @@ impl RawBlockDevice {
     }
 
     /// Synchronous write using io_uring.
-    #[pyo3(signature = (offset, data, payload_len, total_len = None))]
+    #[pyo3(signature = (offset, data, payload_len, total_len = None, placement_id = None))]
     fn write_uring(
         &self,
         py: Python<'_>,
@@ -1916,6 +2078,7 @@ impl RawBlockDevice {
         data: &Bound<'_, PyAny>,
         payload_len: usize,
         total_len: Option<usize>,
+        placement_id: Option<i32>,
     ) -> PyResult<()> {
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
@@ -1975,6 +2138,9 @@ impl RawBlockDevice {
             None
         };
 
+        // Get placement ID for this write (negative or None means no FDP)
+        let placement_id_u16 = placement_id.filter(|&pid| pid >= 0).map(|pid| pid as u16);
+
         // Use bounce buffer if:
         // Buffer is not aligned (O_DIRECT requirement)
         // Buffer capacity is less than total_len
@@ -2003,6 +2169,8 @@ impl RawBlockDevice {
                         lba_shift: self.nvme_lba_shift.ok_or_else(|| {
                             PyRuntimeError::new_err("NVMe LBA shift not available")
                         })?,
+                        dtype: 0x2,
+                        dspec: placement_id_u16.unwrap_or(0),
                     })
                 } else {
                     None
@@ -2047,6 +2215,8 @@ impl RawBlockDevice {
                         lba_shift: self.nvme_lba_shift.ok_or_else(|| {
                             PyRuntimeError::new_err("NVMe LBA shift not available")
                         })?,
+                        dtype: 0x2,
+                        dspec: placement_id_u16.unwrap_or(0),
                     })
                 } else {
                     None
@@ -2173,6 +2343,8 @@ impl RawBlockDevice {
                 lba_shift: self
                     .nvme_lba_shift
                     .ok_or_else(|| PyRuntimeError::new_err("NVMe LBA shift not available"))?,
+                dtype: 0,
+                dspec: 0,
             })
         } else {
             None
