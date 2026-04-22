@@ -1447,8 +1447,12 @@ class RustRawBlockBackend(StoragePluginInterface):
 
         raw = self._rawdev()
 
-        raw.pwrite_from_buffer(payload_off, payload, payload_len, payload_total_len)
-        raw.pwrite_from_buffer(target, header_block, self.block_align, self.block_align)
+        if self.use_uring:
+            raw.write_uring(payload_off, payload, payload_len, payload_total_len)
+            raw.write_uring(target, header_block, self.block_align, self.block_align)
+        else:
+            raw.pwrite_from_buffer(payload_off, payload, payload_len, payload_total_len)
+            raw.pwrite_from_buffer(target, header_block, self.block_align, self.block_align)
 
         with self._lock:
             self._meta_seq = int(next_seq)
