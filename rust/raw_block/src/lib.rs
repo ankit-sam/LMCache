@@ -27,6 +27,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use io_uring::cqueue::Entry32;
+use io_uring::squeue::Entry128;
 use io_uring::types::Fd;
 use io_uring::{opcode, IoUring};
 
@@ -89,9 +91,39 @@ const NVME_ADMIN_IDENTIFY: u8 = 0x06;
 // NVMe identify CNS values
 const NVME_IDENTIFY_CNS_NS: u32 = 0x00;
 
+// NVMe I/O opcodes
+const NVME_IO_READ: u8 = 0x02;
+const NVME_IO_WRITE: u8 = 0x01;
+
+// NVMe uring command structure (80 bytes)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct NvmeUringCmd {
+    opcode: u8,
+    flags: u8,
+    rsvd1: u16,
+    nsid: u32,
+    cdw2: u32,
+    cdw3: u32,
+    metadata: u64,
+    addr: u64,
+    metadata_len: u32,
+    data_len: u32,
+    cdw10: u32,
+    cdw11: u32,
+    cdw12: u32,
+    cdw13: u32,
+    cdw14: u32,
+    cdw15: u32,
+    rsvd2: [u32; 4],
+}
+
 // Linux ioctl for NVMe admin command
 // Defined in <linux/nvme_ioctl.h>: NVME_IOCTL_ADMIN_CMD _IOWR ('N', 0x41)
 const NVME_IOCTL_ADMIN_CMD: libc::c_ulong = 0xC048_4E41;
+
+// NVMe io_uring_cmd opcodes
+const NVME_URING_CMD_IO: u32 = 0xC048_4E80;
 
 // Linux ioctl for NVMe namespace ID
 // Defined in <linux/nvme_ioctl.h>: NVME_IOCTL_ID _IO ('N', 0x40)
@@ -336,6 +368,46 @@ fn nvme_identify_ns(fd: RawFd, nsid: u32) -> Result<NvmeIdNs, PyErr> {
     Ok(id_ns)
 }
 
+/// Prepare NVMe uring command for read/write operations
+fn nvme_uring_cmd_prep(
+    cmd: &mut NvmeUringCmd,
+    is_write: bool,
+    nsid: u32,
+    offset: u64,
+    len: usize,
+    lba_shift: u32,
+    ptr: *const u8,
+) -> Result<(), PyErr> {
+    // Calculate SLBA (Starting LBA) and NLB (Number of LBAs)
+    let slba = offset >> lba_shift;
+    let nlb = (len >> lba_shift) - 1; // NLB is 0-based
+
+    // Set opcode
+    cmd.opcode = if is_write {
+        NVME_IO_WRITE
+    } else {
+        NVME_IO_READ
+    };
+    cmd.nsid = nsid;
+
+    // Set SLBA in cdw10 and cdw11
+    cmd.cdw10 = (slba & 0xFFFFFFFF) as u32;
+    cmd.cdw11 = (slba >> 32) as u32;
+
+    // Set NLB in cdw12 (bits 0-15)
+    cmd.cdw12 = nlb as u32;
+
+    // Set data address and length
+    cmd.addr = ptr as u64;
+    cmd.data_len = len as u32;
+
+    // No metadata support for now
+    cmd.metadata = 0;
+    cmd.metadata_len = 0;
+
+    Ok(())
+}
+
 /// Aligned buffer for O_DIRECT I/O.
 /// Allocated with posix_memalign so the pointer satisfies alignment requirements.
 /// Automatically freed on drop.
@@ -469,6 +541,16 @@ impl IoCompletion {
     }
 }
 
+/// NVMe command data for io_uring_cmd submissions.
+///
+/// This structure contains NVMe-specific information needed for
+/// passthrough commands via io_uring_cmd.
+#[derive(Clone, Debug)]
+struct NvmeCmdData {
+    nsid: u32,      // Namespace ID
+    lba_shift: u32, // LBA shift (log2 of LBA size)
+}
+
 /// Represents a single I/O submission to io_uring.
 ///
 /// This struct is sent from Python threads to the worker thread via a queue.
@@ -486,6 +568,7 @@ impl IoCompletion {
 /// - `original_ptr`: For reads with bounce buffer, the original destination pointer.
 /// - `payload_len`: For reads with bounce buffer, the actual payload length to copy back.
 /// - `batch_id`: The batch ID this submission belongs to (for per-batch tracking)
+/// - `nvme_cmd_data`: Optional NVMe command data for io_uring_cmd submissions
 #[derive(Clone)]
 struct IoSubmission {
     fd: RawFd,
@@ -496,9 +579,10 @@ struct IoSubmission {
     completion: Arc<IoCompletion>,
     fixed_buffer_idx: Option<u16>,
     bounce: Option<std::sync::Arc<AlignedBuf>>,
-    original_ptr: Option<usize>, // For bounce buffer reads
-    payload_len: Option<usize>,  // For bounce buffer reads
-    batch_id: u64,               // Batch ID for per-batch tracking
+    original_ptr: Option<usize>,        // For bounce buffer reads
+    payload_len: Option<usize>,         // For bounce buffer reads
+    batch_id: u64,                      // Batch ID for per-batch tracking
+    nvme_cmd_data: Option<NvmeCmdData>, // NVMe command data for io_uring_cmd
 }
 
 impl Default for IoSubmission {
@@ -515,6 +599,7 @@ impl Default for IoSubmission {
             original_ptr: None,
             payload_len: None,
             batch_id: 0,
+            nvme_cmd_data: None,
         }
     }
 }
@@ -526,18 +611,19 @@ impl Default for IoSubmission {
 /// Higher-level policies (slotting, manifests, etc.) live in Python.
 #[pyclass]
 struct RawBlockDevice {
-    fd: RawFd,          // raw file descriptor
-    size: u64,          // cached device size in bytes
-    closed: AtomicBool, // avoid double-close
-    use_odirect: bool,  // enforce alignment + bypass page cache
-    alignment: usize,   // required alignment in bytes
-    use_iouring: bool,  // Enable io_uring
+    fd: RawFd,           // raw file descriptor
+    size: u64,           // cached device size in bytes
+    closed: AtomicBool,  // avoid double-close
+    use_odirect: bool,   // enforce alignment + bypass page cache
+    alignment: usize,    // required alignment in bytes
+    use_iouring: bool,   // Enable io_uring
+    use_uring_cmd: bool, // Enable io_uring_cmd for NVMe passthrough
     // NVMe device data (only when use_uring_cmd=true)
     nvme_nsid: Option<u32>,      // Namespace ID
     nvme_lba_shift: Option<u32>, // LBA shift (log2 of LBA size)
     nvme_lba_size: Option<u32>,  // LBA size in bytes
     // io_uring ring instance (only when use_iouring=true)
-    ring: Option<Arc<Mutex<IoUring>>>,
+    ring: Option<Arc<Mutex<IoUring<Entry128, Entry32>>>>,
     // Queue for sending I/O requests from Python to worker thread
     queue: Option<Arc<Mutex<Vec<IoSubmission>>>>,
     // Background worker thread handle
@@ -580,6 +666,12 @@ impl RawBlockDevice {
         use_iouring: bool,
         use_uring_cmd: bool,
     ) -> PyResult<Self> {
+        // use_uring_cmd requires use_iouring to be enabled
+        if use_uring_cmd && !use_iouring {
+            return Err(PyValueError::new_err(
+                "use_uring_cmd requires use_iouring to be enabled",
+            ));
+        }
         let cpath =
             CString::new(path.clone()).map_err(|_| PyValueError::new_err("path contains NUL"))?;
         let mut flags = if writable {
@@ -646,7 +738,14 @@ impl RawBlockDevice {
             next_batch_id_opt,
             batch_in_flight_opt,
         ) = if use_iouring {
-            let ring = IoUring::new(RING_SIZE as u32)
+            // Create IoUring with Entry32 CQE type when using io_uring_cmd
+            // to support big CQE entries (32 bytes instead of 16 bytes)
+            // Create IoUring with big SQE/CQE entries when using io_uring
+            // Entry128 (128-byte SQE) and Entry32 (32-byte CQE) are used to support
+            // NVMe passthrough commands via io_uring_cmd
+            // Regular read/write operations are converted to Entry128 using .into()
+            let ring = IoUring::<Entry128, Entry32>::builder()
+                .build(RING_SIZE as u32)
                 .map_err(|e| PyRuntimeError::new_err(format!("io_uring init failed: {}", e)))?;
             let ring = Arc::new(Mutex::new(ring));
             let queue = Arc::new(Mutex::new(Vec::<IoSubmission>::new()));
@@ -783,9 +882,10 @@ impl RawBlockDevice {
                                                 .build()
                                         };
                                         let sqe = sqe.user_data(user_data);
+                                        let sqe128: Entry128 = sqe.into();
                                         unsafe {
                                             ring.submission()
-                                                .push(&sqe)
+                                                .push(&sqe128)
                                                 .expect("failed to push sqe for short read/write");
                                         }
                                         // Submit the new SQE to the kernel
@@ -889,33 +989,85 @@ impl RawBlockDevice {
                             in_flight.insert(user_data, sub.clone());
 
                             let ptr = sub.ptr_addr as *mut u8;
-                            let sqe = if sub.is_write {
+
+                            // Check if this is an io_uring_cmd submission
+                            if let Some(nvme_data) = &sub.nvme_cmd_data {
+                                // Prepare NVMe uring command
+                                let mut nvme_cmd: NvmeUringCmd = unsafe { std::mem::zeroed() };
+                                nvme_uring_cmd_prep(
+                                    &mut nvme_cmd,
+                                    sub.is_write,
+                                    nvme_data.nsid,
+                                    sub.offset,
+                                    sub.len,
+                                    nvme_data.lba_shift,
+                                    ptr,
+                                )
+                                .expect("Failed to prepare NVMe uring command");
+
+                                // Convert NvmeUringCmd to byte array for UringCmd80
+                                let cmd_bytes: [u8; 80] =
+                                    unsafe { std::mem::transmute_copy(&nvme_cmd) };
+
+                                // Build UringCmd80 with big SQE entry
+                                // If using fixed buffers, set buf_index which will automatically
+                                // set IORING_URING_CMD_FIXED flag
+                                let mut uring_cmd =
+                                    opcode::UringCmd80::new(Fd(sub.fd), NVME_URING_CMD_IO)
+                                        .cmd(cmd_bytes);
+
+                                // Set buf_index if using fixed buffers
                                 if let Some(idx) = sub.fixed_buffer_idx {
-                                    opcode::WriteFixed::new(
-                                        Fd(sub.fd),
-                                        ptr as *const u8,
-                                        sub.len as u32,
-                                        idx,
-                                    )
-                                    .offset(sub.offset)
-                                    .build()
-                                } else {
-                                    opcode::Write::new(Fd(sub.fd), ptr as *const u8, sub.len as u32)
+                                    uring_cmd = uring_cmd.buf_index(Some(idx));
+                                }
+
+                                let sqe128 = uring_cmd.build();
+
+                                // Set user_data on the inner Entry
+                                let sqe128 = sqe128.user_data(user_data);
+
+                                // Push the big SQE entry (128 bytes)
+                                unsafe {
+                                    ring.submission()
+                                        .push(&sqe128)
+                                        .expect("failed to push sqe128");
+                                }
+                            } else {
+                                // Regular read/write operations
+                                let sqe = if sub.is_write {
+                                    if let Some(idx) = sub.fixed_buffer_idx {
+                                        opcode::WriteFixed::new(
+                                            Fd(sub.fd),
+                                            ptr as *const u8,
+                                            sub.len as u32,
+                                            idx,
+                                        )
                                         .offset(sub.offset)
                                         .build()
+                                    } else {
+                                        opcode::Write::new(
+                                            Fd(sub.fd),
+                                            ptr as *const u8,
+                                            sub.len as u32,
+                                        )
+                                        .offset(sub.offset)
+                                        .build()
+                                    }
+                                } else if let Some(idx) = sub.fixed_buffer_idx {
+                                    opcode::ReadFixed::new(Fd(sub.fd), ptr, sub.len as u32, idx)
+                                        .offset(sub.offset)
+                                        .build()
+                                } else {
+                                    opcode::Read::new(Fd(sub.fd), ptr, sub.len as u32)
+                                        .offset(sub.offset)
+                                        .build()
+                                };
+                                let sqe = sqe.user_data(user_data);
+                                // Convert Entry to Entry128 for submission
+                                let sqe128: Entry128 = sqe.into();
+                                unsafe {
+                                    ring.submission().push(&sqe128).expect("failed to push sqe");
                                 }
-                            } else if let Some(idx) = sub.fixed_buffer_idx {
-                                opcode::ReadFixed::new(Fd(sub.fd), ptr, sub.len as u32, idx)
-                                    .offset(sub.offset)
-                                    .build()
-                            } else {
-                                opcode::Read::new(Fd(sub.fd), ptr, sub.len as u32)
-                                    .offset(sub.offset)
-                                    .build()
-                            };
-                            let sqe = sqe.user_data(user_data);
-                            unsafe {
-                                ring.submission().push(&sqe).expect("failed to push sqe");
                             }
                         }
 
@@ -1151,6 +1303,7 @@ impl RawBlockDevice {
             use_odirect,
             alignment,
             use_iouring,
+            use_uring_cmd,
             nvme_nsid,
             nvme_lba_shift,
             nvme_lba_size,
@@ -1368,6 +1521,7 @@ impl RawBlockDevice {
         let fd = self.fd;
         let use_odirect = self.use_odirect;
         let alignment = self.alignment;
+        let use_uring_cmd = self.use_uring_cmd;
         let fixed_buffers_registered = self.fixed_buffers_registered.load(Ordering::Relaxed);
         // Clone the fixed buffer map before releasing GIL to avoid lock contention
         let fixed_buffer_map: HashMap<usize, (u16, usize)> = if fixed_buffers_registered {
@@ -1375,6 +1529,19 @@ impl RawBlockDevice {
             map.clone()
         } else {
             HashMap::new()
+        };
+        // Get NVMe data for io_uring_cmd
+        let nvme_cmd_data = if use_uring_cmd {
+            Some(NvmeCmdData {
+                nsid: self
+                    .nvme_nsid
+                    .ok_or_else(|| PyRuntimeError::new_err("NVMe namespace ID not available"))?,
+                lba_shift: self
+                    .nvme_lba_shift
+                    .ok_or_else(|| PyRuntimeError::new_err("NVMe LBA shift not available"))?,
+            })
+        } else {
+            None
         };
         let in_flight_count = Arc::clone(&self.in_flight_count);
         let queue = Arc::clone(self.queue.as_ref().unwrap());
@@ -1436,6 +1603,7 @@ impl RawBlockDevice {
                     original_ptr: None,
                     payload_len: None,
                     batch_id,
+                    nvme_cmd_data: nvme_cmd_data.clone(),
                 };
 
                 submissions.push((sub, comp));
@@ -1670,6 +1838,18 @@ impl RawBlockDevice {
                 original_ptr: None,
                 payload_len: None,
                 batch_id: 0,
+                nvme_cmd_data: if self.use_uring_cmd {
+                    Some(NvmeCmdData {
+                        nsid: self.nvme_nsid.ok_or_else(|| {
+                            PyRuntimeError::new_err("NVMe namespace ID not available")
+                        })?,
+                        lba_shift: self.nvme_lba_shift.ok_or_else(|| {
+                            PyRuntimeError::new_err("NVMe LBA shift not available")
+                        })?,
+                    })
+                } else {
+                    None
+                },
             };
             {
                 let q = self.queue.as_ref().expect("queue must exist");
@@ -1698,6 +1878,18 @@ impl RawBlockDevice {
                 original_ptr: Some(ptr as usize),
                 payload_len: Some(payload_len),
                 batch_id: 0,
+                nvme_cmd_data: if self.use_uring_cmd {
+                    Some(NvmeCmdData {
+                        nsid: self.nvme_nsid.ok_or_else(|| {
+                            PyRuntimeError::new_err("NVMe namespace ID not available")
+                        })?,
+                        lba_shift: self.nvme_lba_shift.ok_or_else(|| {
+                            PyRuntimeError::new_err("NVMe LBA shift not available")
+                        })?,
+                    })
+                } else {
+                    None
+                },
             };
             {
                 let q = self.queue.as_ref().expect("queue must exist");
@@ -1802,6 +1994,7 @@ impl RawBlockDevice {
         let fd = self.fd;
         let use_odirect = self.use_odirect;
         let alignment = self.alignment;
+        let use_uring_cmd = self.use_uring_cmd;
         let fixed_buffers_registered = self.fixed_buffers_registered.load(Ordering::Relaxed);
         // Clone the fixed buffer map before releasing GIL to avoid lock contention
         let fixed_buffer_map: HashMap<usize, (u16, usize)> = if fixed_buffers_registered {
@@ -1809,6 +2002,19 @@ impl RawBlockDevice {
             map.clone()
         } else {
             HashMap::new()
+        };
+        // Get NVMe data for io_uring_cmd
+        let nvme_cmd_data = if use_uring_cmd {
+            Some(NvmeCmdData {
+                nsid: self
+                    .nvme_nsid
+                    .ok_or_else(|| PyRuntimeError::new_err("NVMe namespace ID not available"))?,
+                lba_shift: self
+                    .nvme_lba_shift
+                    .ok_or_else(|| PyRuntimeError::new_err("NVMe LBA shift not available"))?,
+            })
+        } else {
+            None
         };
         let in_flight_count = Arc::clone(&self.in_flight_count);
         let queue = Arc::clone(self.queue.as_ref().unwrap());
@@ -1871,6 +2077,7 @@ impl RawBlockDevice {
                     original_ptr: None,
                     payload_len: None,
                     batch_id,
+                    nvme_cmd_data: nvme_cmd_data.clone(),
                 };
 
                 submissions.push((sub, comp));
