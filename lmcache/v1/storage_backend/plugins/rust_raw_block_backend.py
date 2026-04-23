@@ -43,6 +43,45 @@ def _round_up(x: int, align: int) -> int:
     return ((x + align - 1) // align) * align
 
 
+def _split_large_request(
+    offset: int,
+    total_len: int,
+    max_transfer_size: int,
+    block_align: int,
+) -> list[tuple[int, int]]:
+    """
+    Split a large I/O request into multiple smaller requests.
+
+    Args:
+        offset: Starting offset of the request
+        total_len: Total length of the request
+        max_transfer_size: Maximum size per transfer (0 = no splitting)
+        block_align: Block alignment requirement
+
+    Returns:
+        List of (offset, length) tuples for each sub-request
+    """
+    if max_transfer_size <= 0 or total_len <= max_transfer_size:
+        return [(offset, total_len)]
+
+    # Align max_transfer_size to block_align
+    aligned_max = (max_transfer_size // block_align) * block_align
+    if aligned_max == 0:
+        aligned_max = block_align
+
+    sub_requests = []
+    current_offset = offset
+    remaining = total_len
+
+    while remaining > 0:
+        chunk_len = min(remaining, aligned_max)
+        sub_requests.append((current_offset, chunk_len))
+        current_offset += chunk_len
+        remaining -= chunk_len
+
+    return sub_requests
+
+
 def _validate_per_tp_device_paths(per_tp_devices: PerTPDevicePaths) -> None:
     """Validate per-TP device mapping and enforce unique paths."""
     values = list(per_tp_devices.values())
@@ -192,6 +231,13 @@ class RustRawBlockBackend(StoragePluginInterface):
 
         # Store placement identifiers for FDP device.
         self._placement_ids: list[int] = []
+
+        # Maximum data transfer size for a single I/O request
+        # Requests larger than this will be split into multiple smaller requests
+        # Default: 0 (no splitting)
+        self.max_data_transfer_size: int = int(
+            extra.get("rust_raw_block.max_data_transfer_size", 0)
+        )
 
         # On-device metadata region config.
         self.meta_total_bytes: int = int(
@@ -815,15 +861,44 @@ class RustRawBlockBackend(StoragePluginInterface):
                 if self.use_odirect and len(header_bytes) < hdr_total:
                     header_bytes.extend(b"\x00" * (hdr_total - len(header_bytes)))
 
-                offsets.append(offset)
-                buffers.append(header_bytes)
-                total_lens.append(hdr_total)
-                placement_ids.append(placement_id)
+                # Check if we need to split the payload write
+                if (
+                    self.max_data_transfer_size > 0
+                    and total_len > self.max_data_transfer_size
+                ):
+                    payload_sub_requests = _split_large_request(
+                        offset + self.header_bytes,
+                        total_len,
+                        self.max_data_transfer_size,
+                        self.block_align,
+                    )
 
-                offsets.append(offset + self.header_bytes)
-                buffers.append(buf)
-                total_lens.append(total_len)
-                placement_ids.append(placement_id)
+                    # Add header write
+                    offsets.append(offset)
+                    buffers.append(header_bytes)
+                    total_lens.append(hdr_total)
+                    placement_ids.append(placement_id)
+
+                    # Add each payload chunk
+                    for chunk_offset, chunk_len in payload_sub_requests:
+                        # Calculate buffer offset for this chunk
+                        buffer_offset = chunk_offset - (offset + self.header_bytes)
+                        chunk_buf = buf[buffer_offset : buffer_offset + chunk_len]
+                        offsets.append(chunk_offset)
+                        buffers.append(chunk_buf)
+                        total_lens.append(chunk_len)
+                        placement_ids.append(placement_id)
+                else:
+                    # No splitting needed
+                    offsets.append(offset)
+                    buffers.append(header_bytes)
+                    total_lens.append(hdr_total)
+                    placement_ids.append(placement_id)
+
+                    offsets.append(offset + self.header_bytes)
+                    buffers.append(buf)
+                    total_lens.append(total_len)
+                    placement_ids.append(placement_id)
 
                 with self._lock:
                     self._inflight_io_count += 1
@@ -1008,7 +1083,31 @@ class RustRawBlockBackend(StoragePluginInterface):
             with self._lock:
                 self._inflight_io_count += 1
             if self.use_uring:
-                raw.read_uring(offset, buf, self.header_bytes, self.header_bytes)
+                # Check if we need to split the header read (unlikely)
+                if (
+                    self.max_data_transfer_size > 0
+                    and self.header_bytes > self.max_data_transfer_size
+                ):
+                    # Split the header read into multiple chunks
+                    sub_requests = _split_large_request(
+                        offset,
+                        self.header_bytes,
+                        self.max_data_transfer_size,
+                        self.block_align,
+                    )
+
+                    buffer_offset = 0
+                    for chunk_offset, chunk_len in sub_requests:
+                        chunk_buf = buf[buffer_offset : buffer_offset + chunk_len]
+                        chunk_payload = min(
+                            self.header_bytes - buffer_offset, chunk_len
+                        )
+                        raw.read_uring(
+                            chunk_offset, chunk_buf, chunk_payload, chunk_len
+                        )
+                        buffer_offset += chunk_len
+                else:
+                    raw.read_uring(offset, buf, self.header_bytes, self.header_bytes)
             else:
                 raw.pread_into(offset, buf, self.header_bytes, self.header_bytes)
             return self._decode_slot_header(buf)
@@ -1094,14 +1193,40 @@ class RustRawBlockBackend(StoragePluginInterface):
                     zero_tail=False,
                 )
 
-                if direct_view is not None:
-                    offsets.append(entry.offset + self.header_bytes)
-                    buffers.append(direct_view)
-                    total_lens.append(total_len)
+                # Check if we need to split the read
+                if (
+                    self.max_data_transfer_size > 0
+                    and total_len > self.max_data_transfer_size
+                ):
+                    read_sub_requests = _split_large_request(
+                        entry.offset + self.header_bytes,
+                        total_len,
+                        self.max_data_transfer_size,
+                        self.block_align,
+                    )
+
+                    # Use the appropriate buffer (direct_view or buf)
+                    read_buf = direct_view if direct_view is not None else buf
+                    # Add each read chunk
+                    for chunk_offset, chunk_len in read_sub_requests:
+                        # Calculate buffer offset for this chunk
+                        buffer_offset = chunk_offset - (
+                            entry.offset + self.header_bytes
+                        )
+                        chunk_buf = read_buf[buffer_offset : buffer_offset + chunk_len]
+                        offsets.append(chunk_offset)
+                        buffers.append(chunk_buf)
+                        total_lens.append(chunk_len)
                 else:
-                    offsets.append(entry.offset + self.header_bytes)
-                    buffers.append(buf)
-                    total_lens.append(total_len)
+                    # No splitting needed
+                    if direct_view is not None:
+                        offsets.append(entry.offset + self.header_bytes)
+                        buffers.append(direct_view)
+                        total_lens.append(total_len)
+                    else:
+                        offsets.append(entry.offset + self.header_bytes)
+                        buffers.append(buf)
+                        total_lens.append(total_len)
 
                 valid_keys.append(key)
                 valid_objs.append(memory_obj)
@@ -1385,9 +1510,31 @@ class RustRawBlockBackend(StoragePluginInterface):
         buf = bytearray(self.block_align)
         try:
             if self.use_uring:
-                raw.read_uring(
-                    container_offset, buf, self.block_align, self.block_align
-                )
+                # Check if we need to split the metadata header read (unlikely)
+                if (
+                    self.max_data_transfer_size > 0
+                    and self.block_align > self.max_data_transfer_size
+                ):
+                    # Split the metadata header read into multiple chunks
+                    sub_requests = _split_large_request(
+                        container_offset,
+                        self.block_align,
+                        self.max_data_transfer_size,
+                        self.block_align,
+                    )
+
+                    buffer_offset = 0
+                    for chunk_offset, chunk_len in sub_requests:
+                        chunk_buf = buf[buffer_offset : buffer_offset + chunk_len]
+                        chunk_payload = min(self.block_align - buffer_offset, chunk_len)
+                        raw.read_uring(
+                            chunk_offset, chunk_buf, chunk_payload, chunk_len
+                        )
+                        buffer_offset += chunk_len
+                else:
+                    raw.read_uring(
+                        container_offset, buf, self.block_align, self.block_align
+                    )
             else:
                 raw.pread_into(
                     container_offset, buf, self.block_align, self.block_align
@@ -1419,7 +1566,30 @@ class RustRawBlockBackend(StoragePluginInterface):
         buf = bytearray(total_len)
         try:
             if self.use_uring:
-                raw.read_uring(payload_off, buf, payload_len, total_len)
+                # Check if we need to split the metadata read
+                if (
+                    self.max_data_transfer_size > 0
+                    and total_len > self.max_data_transfer_size
+                ):
+                    # Split the metadata read into multiple chunks
+                    sub_requests = _split_large_request(
+                        payload_off,
+                        total_len,
+                        self.max_data_transfer_size,
+                        self.block_align,
+                    )
+
+                    buffer_offset = 0
+                    for chunk_offset, chunk_len in sub_requests:
+                        chunk_buf = buf[buffer_offset : buffer_offset + chunk_len]
+                        # Calculate payload_len for this chunk
+                        chunk_payload = min(payload_len - buffer_offset, chunk_len)
+                        raw.read_uring(
+                            chunk_offset, chunk_buf, chunk_payload, chunk_len
+                        )
+                        buffer_offset += chunk_len
+                else:
+                    raw.read_uring(payload_off, buf, payload_len, total_len)
             else:
                 raw.pread_into(payload_off, buf, payload_len, total_len)
         except Exception:
@@ -1528,20 +1698,40 @@ class RustRawBlockBackend(StoragePluginInterface):
             metadata_placement_id = self._placement_ids[-1]
 
         if self.use_uring:
-            raw.write_uring(
-                payload_off,
-                payload,
-                payload_len,
-                payload_total_len,
-                metadata_placement_id,
-            )
-            raw.write_uring(
-                target,
-                header_block,
-                self.block_align,
-                self.block_align,
-                metadata_placement_id,
-            )
+            # Check if we need to split the metadata write
+            if (
+                self.max_data_transfer_size > 0
+                and payload_total_len > self.max_data_transfer_size
+            ):
+                # Split the metadata write into multiple chunks
+                sub_requests = _split_large_request(
+                    payload_off,
+                    payload_total_len,
+                    self.max_data_transfer_size,
+                    self.block_align,
+                )
+
+                buffer_offset = 0
+                for chunk_offset, chunk_len in sub_requests:
+                    chunk_payload = min(payload_len - buffer_offset, chunk_len)
+                    chunk_buf = payload[buffer_offset : buffer_offset + chunk_len]
+                    raw.write_uring(
+                        chunk_offset,
+                        chunk_buf,
+                        chunk_payload,
+                        chunk_len,
+                        metadata_placement_id,
+                    )
+                    buffer_offset += chunk_len
+            else:
+                raw.write_uring(
+                    payload_off,
+                    payload,
+                    payload_len,
+                    payload_total_len,
+                    metadata_placement_id,
+                )
+            raw.write_uring(target, header_block, self.block_align, self.block_align)
         else:
             raw.pwrite_from_buffer(payload_off, payload, payload_len, payload_total_len)
             raw.pwrite_from_buffer(
