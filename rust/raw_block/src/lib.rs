@@ -901,13 +901,44 @@ impl RawBlockDevice {
                             let user_data = cqe.user_data();
                             if let Some(mut sub) = in_flight.remove(&user_data) {
                                 let batch_id = sub.batch_id;
+                                let is_uring_cmd = sub.nvme_cmd_data.is_some();
                                 if cqe.result() < 0 {
                                     let code = -cqe.result();
                                     // Drop any bounce buffer associated with this submission.
                                     let _ = sub.bounce.take();
                                     sub.completion
                                         .set(Err(PyOSError::new_err((code, "io_uring I/O error"))));
+                                } else if is_uring_cmd {
+                                    // Non-zero result indicates NVMe command error
+                                    if cqe.result() != 0 {
+                                        let code = cqe.result() as i32;
+                                        // Drop any bounce buffer associated with this submission.
+                                        let _ = sub.bounce.take();
+                                        sub.completion
+                                            .set(Err(PyOSError::new_err((code, "io_uring_cmd NVMe error"))));
+                                    } else {
+                                        // io_uring_cmd successful completion (result == 0)
+                                        // For reads with bounce buffer, copy data back to original buffer
+                                        if !sub.is_write {
+                                            if let (Some(bounce), Some(orig_ptr), Some(payload_len)) =
+                                                (sub.bounce.take(), sub.original_ptr, sub.payload_len)
+                                            {
+                                                unsafe {
+                                                    libc::memcpy(
+                                                        orig_ptr as *mut libc::c_void,
+                                                        bounce.as_ptr() as *const libc::c_void,
+                                                        payload_len,
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            // Drop any bounce buffer associated with this submission.
+                                            let _ = sub.bounce.take();
+                                        }
+                                        sub.completion.set(Ok(()));
+                                    }
                                 } else {
+                                    // Regular io_uring read/write: check for partial completion
                                     let bytes_transferred = cqe.result() as usize;
                                     if bytes_transferred < sub.len {
                                         // Short read/write: update offset and length, then resubmit
@@ -1294,13 +1325,42 @@ impl RawBlockDevice {
                         let user_data = cqe.user_data();
                         if let Some(mut sub) = in_flight.remove(&user_data) {
                             let batch_id = sub.batch_id;
+                            let is_uring_cmd = sub.nvme_cmd_data.is_some();
                             if cqe.result() < 0 {
                                 let code = -cqe.result();
                                 // Drop any bounce buffer associated with this submission.
                                 let _ = sub.bounce.take();
                                 sub.completion
                                     .set(Err(PyOSError::new_err((code, "io_uring I/O error"))));
+                            } else if is_uring_cmd {
+                                // Non-zero result indicates NVMe command error
+                                if cqe.result() != 0 {
+                                    let code = cqe.result() as i32;
+                                    // Drop any bounce buffer associated with this submission.
+                                    let _ = sub.bounce.take();
+                                    sub.completion
+                                        .set(Err(PyOSError::new_err((code, "io_uring_cmd NVMe error"))));
+                                } else {
+                                    if !sub.is_write {
+                                        if let (Some(bounce), Some(orig_ptr), Some(payload_len)) =
+                                            (sub.bounce.take(), sub.original_ptr, sub.payload_len)
+                                        {
+                                            unsafe {
+                                                libc::memcpy(
+                                                    orig_ptr as *mut libc::c_void,
+                                                    bounce.as_ptr() as *const libc::c_void,
+                                                    payload_len,
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        // Drop any bounce buffer associated with this submission.
+                                        let _ = sub.bounce.take();
+                                    }
+                                    sub.completion.set(Ok(()));
+                                }
                             } else {
+                                // Regular io_uring read/write: check for partial completion
                                 let bytes_transferred = cqe.result() as usize;
                                 if bytes_transferred < sub.len {
                                     // Short read/write during shutdown: fail the request
