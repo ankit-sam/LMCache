@@ -240,9 +240,12 @@ def _bench_rust_raw_block(
     raw_device_size_gb: float,
     use_odirect: bool,
     use_uring: bool,
+    use_uring_cmd: bool,
+    use_fdp: bool,
     alignment: int,
     cleanup_raw_device: bool,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    max_data_transfer_size: int = 0,
 ) -> dict:
     loop, t = _start_loop()
 
@@ -282,6 +285,7 @@ def _bench_rust_raw_block(
     # device path (e.g. /dev/nvme*), do not truncate.
     temp_dir: Optional[str] = None
     is_block_device = False
+    is_char_device = False
     if not raw_device:
         temp_dir = tempfile.mkdtemp(prefix="raw_block_bench_")
         raw_device = os.path.join(temp_dir, "raw_block.bin")
@@ -289,10 +293,12 @@ def _bench_rust_raw_block(
         try:
             st_mode = os.stat(raw_device).st_mode
             is_block_device = stat.S_ISBLK(st_mode)
+            is_char_device = stat.S_ISCHR(st_mode)
         except FileNotFoundError:
             is_block_device = False
+            is_char_device = False
 
-    if raw_device and not is_block_device:
+    if raw_device and not is_block_device and not is_char_device:
         with open(raw_device, "wb") as f:
             f.truncate(int(raw_device_size_gb * 1024**3))
 
@@ -302,6 +308,9 @@ def _bench_rust_raw_block(
         "rust_raw_block.header_bytes": alignment,
         "rust_raw_block.use_odirect": use_odirect,
         "rust_raw_block.use_uring": use_uring,
+        "rust_raw_block.use_uring_cmd": use_uring_cmd,
+        "rust_raw_block.use_fdp": use_fdp,
+        "rust_raw_block.max_data_transfer_size": max_data_transfer_size,
     }
 
     # Use MixedMemoryAllocator with use_paging=True for fixed buffer support
@@ -389,6 +398,7 @@ def _bench_rust_raw_block(
         "ops_per_sec": num_ops / elapsed if elapsed > 0 else 0.0,
         "use_odirect": use_odirect,
         "use_uring": use_uring,
+        "use_uring_cmd": use_uring_cmd,
         "raw_device": raw_device,
     }
 
@@ -400,10 +410,13 @@ def _bench_rust_raw_block_read(
     raw_device_size_gb: float,
     use_odirect: bool,
     use_uring: bool,
+    use_uring_cmd: bool,
+    use_fdp: bool,
     alignment: int,
     cleanup_raw_device: bool,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     verify_integrity: bool = False,
+    max_data_transfer_size: int = 0,
 ) -> dict:
     """Benchmark RustRawBlockBackend write & read performance.
 
@@ -418,6 +431,7 @@ def _bench_rust_raw_block_read(
         raw_device_size_gb: Size of raw device in GB (for temp file creation).
         use_odirect: Enable O_DIRECT for I/O operations.
         use_uring: Enable io_uring for I/O operations.
+        use_uring_cmd: Enable io_uring command (NVMe passthrough) for I/O operations.
         alignment: Buffer alignment in bytes.
         cleanup_raw_device: Whether to clean up the raw device after benchmark.
         chunk_size: Chunk size for io_uring case.
@@ -461,6 +475,7 @@ def _bench_rust_raw_block_read(
     # Create a backing file if raw_device is not provided
     temp_dir: Optional[str] = None
     is_block_device = False
+    is_char_device = False
     if not raw_device:
         temp_dir = tempfile.mkdtemp(prefix="raw_block_read_bench_")
         raw_device = os.path.join(temp_dir, "raw_block.bin")
@@ -468,10 +483,12 @@ def _bench_rust_raw_block_read(
         try:
             st_mode = os.stat(raw_device).st_mode
             is_block_device = stat.S_ISBLK(st_mode)
+            is_char_device = stat.S_ISCHR(st_mode)
         except FileNotFoundError:
             is_block_device = False
+            is_char_device = False
 
-    if raw_device and not is_block_device:
+    if raw_device and not is_block_device and not is_char_device:
         with open(raw_device, "wb") as f:
             f.truncate(int(raw_device_size_gb * 1024**3))
 
@@ -481,6 +498,9 @@ def _bench_rust_raw_block_read(
         "rust_raw_block.header_bytes": alignment,
         "rust_raw_block.use_odirect": use_odirect,
         "rust_raw_block.use_uring": use_uring,
+        "rust_raw_block.use_uring_cmd": use_uring_cmd,
+        "rust_raw_block.use_fdp": use_fdp,
+        "rust_raw_block.max_data_transfer_size": max_data_transfer_size,
     }
 
     # Use MixedMemoryAllocator with use_paging=True for fixed buffer support
@@ -613,6 +633,7 @@ def _bench_rust_raw_block_read(
         "total_elapsed_sec": write_elapsed + read_elapsed,
         "use_odirect": use_odirect,
         "use_uring": use_uring,
+        "use_uring_cmd": use_uring_cmd,
         "raw_device": raw_device,
         "verify_integrity": verify_integrity,
         "integrity_errors": integrity_errors,
@@ -669,12 +690,34 @@ def main() -> None:
         action="store_true",
         help="Enable io_uring for raw block backend",
     )
+    parser.add_argument(
+        "--use-uring-cmd",
+        action="store_true",
+        help=(
+            "Enable io_uring for raw block backend. "
+            "Must use nvme character device node (/dev/ngXnY)"
+        ),
+    )
+    parser.add_argument(
+        "--use-fdp",
+        action="store_true",
+        help=(
+            "Use FDP support of the device. Requires use-uring-cmd. "
+            "The device must support FDP and enabled"
+        ),
+    )
     parser.add_argument("--alignment", type=int, default=4096)
     parser.add_argument(
         "--chunk-size",
         type=int,
         default=DEFAULT_CHUNK_SIZE,
         help=f"Chunk size for io_uring case (default: {DEFAULT_CHUNK_SIZE})",
+    )
+    parser.add_argument(
+        "--max-data-transfer-size",
+        type=int,
+        default=0,
+        help="Maximum data transfer size for io_uring (0 = no splitting)",
     )
     parser.add_argument(
         "--verify-integrity",
@@ -718,9 +761,12 @@ def main() -> None:
                 raw_device_size_gb=args.raw_device_size_gb,
                 use_odirect=args.raw_odirect,
                 use_uring=args.use_uring,
+                use_uring_cmd=args.use_uring_cmd,
+                use_fdp=args.use_fdp,
                 alignment=args.alignment,
                 cleanup_raw_device=cleanup_raw_device,
                 chunk_size=args.chunk_size,
+                max_data_transfer_size=args.max_data_transfer_size,
             )
         )
 
@@ -739,10 +785,13 @@ def main() -> None:
                 raw_device_size_gb=args.raw_device_size_gb,
                 use_odirect=args.raw_odirect,
                 use_uring=args.use_uring,
+                use_uring_cmd=args.use_uring_cmd,
+                use_fdp=args.use_fdp,
                 alignment=args.alignment,
                 cleanup_raw_device=cleanup_raw_device,
                 chunk_size=args.chunk_size,
                 verify_integrity=args.verify_integrity,
+                max_data_transfer_size=args.max_data_transfer_size,
             )
         )
 
