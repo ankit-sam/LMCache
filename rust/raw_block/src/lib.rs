@@ -1812,7 +1812,7 @@ impl RawBlockDevice {
                     Some(NvmeCmdData {
                         nsid,
                         lba_shift,
-                        dtype: 0x2,
+                        dtype: if placement_id.is_some() { 0x2 } else { 0x0 },
                         dspec: placement_id.unwrap_or(0),
                     })
                 } else {
@@ -2239,7 +2239,7 @@ impl RawBlockDevice {
                         lba_shift: self.nvme_lba_shift.ok_or_else(|| {
                             PyRuntimeError::new_err("NVMe LBA shift not available")
                         })?,
-                        dtype: 0x2,
+                        dtype: if placement_id_u16.is_some() { 0x2 } else { 0x0 },
                         dspec: placement_id_u16.unwrap_or(0),
                     })
                 } else {
@@ -2285,7 +2285,7 @@ impl RawBlockDevice {
                         lba_shift: self.nvme_lba_shift.ok_or_else(|| {
                             PyRuntimeError::new_err("NVMe LBA shift not available")
                         })?,
-                        dtype: 0x2,
+                        dtype: if placement_id_u16.is_some() { 0x2 } else { 0x0 },
                         dspec: placement_id_u16.unwrap_or(0),
                     })
                 } else {
