@@ -18,15 +18,49 @@ from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
 
 
-def setup_environment_variables(raw_block_path: str, use_uring: bool = False) -> None:
+def _build_per_tp_device_mapping(
+    per_tp_device_paths: list[str] | None,
+) -> dict[str, str]:
+    """Build TP-rank to device mapping from positional CLI inputs."""
+    if not per_tp_device_paths:
+        return {}
+
+    mapping = {}
+    seen_paths = set()
+    for rank, path in enumerate(per_tp_device_paths):
+        if path in seen_paths:
+            raise ValueError(
+                "Duplicate device path in --per_tp_device_paths: "
+                f"{path}. Each TP rank must use a unique device path."
+            )
+        seen_paths.add(path)
+        mapping[str(rank)] = path
+    return mapping
+
+
+def setup_environment_variables(
+    raw_block_path: str,
+    use_uring: bool = False,
+    use_fdp: bool = False,
+    max_data_transfer_size: int = 0,
+    tp: int = 1,
+    per_tp_device_paths: list[str] | None = None,
+) -> None:
     """Set up LMCache-related environment variables for the Rust raw block backend.
 
     Configures environment variables for LMCache including chunk size, storage
     plugins, and Rust raw block backend specific settings.
 
     Args:
-        raw_block_path: Path to the raw block device for storage.
-        use_uring: Whether to enable io_uring path
+        raw_block_path: Path to the raw block device for storage. This is used
+            directly for TP=1 and left empty for TP>1 per-rank device mapping.
+        use_uring: Whether to enable io_uring path.
+        use_fdp: Whether to enable FDP directive for writes.
+        max_data_transfer_size: Maximum transfer size in bytes for each I/O
+            request. `0` disables splitting, `-1` auto-detects from the NVMe
+            queue limit, and a positive value forces an explicit split size.
+        tp: Tensor parallel size.
+        per_tp_device_paths: Optional per-TP device paths.
 
     Returns:
         None
@@ -43,6 +77,11 @@ def setup_environment_variables(raw_block_path: str, use_uring: bool = False) ->
     os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "5"
 
     os.environ["LMCACHE_STORAGE_PLUGINS"] = "raw_block"
+    if tp > 1:
+        # Keep Python hash behavior deterministic across TP workers.
+        os.environ["PYTHONHASHSEED"] = "0"
+
+    per_tp_device_mapping = _build_per_tp_device_mapping(per_tp_device_paths)
 
     # Raw block specific extra config
     os.environ["LMCACHE_EXTRA_CONFIG"] = json.dumps(
@@ -50,17 +89,28 @@ def setup_environment_variables(raw_block_path: str, use_uring: bool = False) ->
             "storage_plugin.raw_block.module_path": "lmcache.v1.storage_backend.plugins.rust_raw_block_backend",  # noqa: E501
             "storage_plugin.raw_block.class_name": "RustRawBlockBackend",
             "rust_raw_block.device_path": raw_block_path,
-            "rust_raw_block.use_odirect": True,
+            # NVMe character devices in FDP mode do not require O_DIRECT.
+            "rust_raw_block.use_odirect": not use_fdp,
             "rust_raw_block.header_bytes": 4096,
             "rust_raw_block.meta_total_bytes": 4 * 1024 * 1024,
             "rust_raw_block.meta_enable_periodic": False,
-            "rust_raw_block.use_uring": use_uring,
+            "rust_raw_block.use_uring": use_uring or use_fdp,
+            "rust_raw_block.use_uring_cmd": use_fdp,
+            "rust_raw_block.use_fdp": use_fdp,
+            "rust_raw_block.max_data_transfer_size": max_data_transfer_size,
+            "rust_raw_block.per_tp_device_paths": (
+                per_tp_device_mapping if tp > 1 else {}
+            ),
         }
     )
 
 
 @contextlib.contextmanager
-def build_llm_with_lmcache(lmcache_connector: str, model: str):
+def build_llm_with_lmcache(
+    lmcache_connector: str,
+    model: str,
+    tp: int = 1,
+):
     """Build a vLLM LLM instance with LMCache integration.
 
     Creates a context manager that builds a vLLM LLM instance configured with
@@ -81,6 +131,7 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         kv_transfer_config=ktc,
         max_model_len=8000,
         gpu_memory_utilization=0.5,
+        tensor_parallel_size=tp,
     )
     llm = LLM(**asdict(llm_args))
     try:
@@ -121,18 +172,46 @@ def parse_args() -> argparse.Namespace:
 
     Returns:
         argparse.Namespace: Parsed arguments containing:
-            - disk_path: Path to the raw block device for storage.
+            - disk_path: Path to the raw block device for storage, including
+              single-namespace FDP runs.
+            - per_tp_device_paths: Per-TP raw block device paths.
             - use_uring: Whether to enable io_uring path.
+            - use_fdp: Whether to enable FDP directive for writes.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument(
+    device_group = parser.add_mutually_exclusive_group(required=True)
+    device_group.add_argument(
         "--disk_path",
         type=str,
+    )
+    device_group.add_argument(
+        "--per_tp_device_paths",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional per-TP device paths in rank order "
+            "('/dev/ng0n1 /dev/ng0n2' -> rank 0/1)."
+        ),
     )
     parser.add_argument(
         "--use_uring",
         action="store_true",
         help="Enable io_uring path (requires Linux kernel >= 5.1)",
+    )
+    parser.add_argument(
+        "--use_fdp",
+        action="store_true",
+        help="Enable FDP write directives.",
+    )
+    parser.add_argument(
+        "--max-data-transfer-size",
+        type=int,
+        default=0,
+        help=(
+            "Maximum data transfer size for io_uring "
+            "(0 = no splitting, -1 = auto from max_hw_sectors_kb, "
+            "> 0 = explicit split size)."
+        ),
     )
     return parser.parse_args()
 
@@ -147,13 +226,28 @@ def main() -> None:
         None
     """
     args = parse_args()
+    per_tp_device_mapping = _build_per_tp_device_mapping(args.per_tp_device_paths)
+    tp = len(per_tp_device_mapping) if per_tp_device_mapping else 1
+    if tp == 1 and args.disk_path is None:
+        raise ValueError("--disk_path is required when TP=1")
+    if tp > 1:
+        # In TP>1 mode, the backend selects rank-local paths from
+        # rust_raw_block.per_tp_device_paths.
+        args.disk_path = ""
 
     connector = "LMCacheConnectorV1"
     model = "Qwen/Qwen3-8B"
 
-    setup_environment_variables(args.disk_path, args.use_uring)
+    setup_environment_variables(
+        args.disk_path,
+        args.use_uring,
+        args.use_fdp,
+        args.max_data_transfer_size,
+        tp,
+        args.per_tp_device_paths,
+    )
 
-    with build_llm_with_lmcache(connector, model) as llm:
+    with build_llm_with_lmcache(connector, model, tp) as llm:
         # This example script runs two requests with a shared prefix.
         # Define the shared prompt and specific prompts
         shared_prompt = "Hello, how are you?" * 1000
