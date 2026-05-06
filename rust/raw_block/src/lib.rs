@@ -799,12 +799,10 @@ impl RawBlockDevice {
 
             // Get namespace ID from device path
             let nsid = nvme_get_nsid_from_fd(fd)?;
-            println!("nsid = {}", nsid);
             // Send identify namespace command to get LBA size
             let id_ns = nvme_identify_ns(fd, nsid)?;
             let lba_shift = nvme_get_lba_shift(&id_ns)?;
             let lba_size = nvme_get_lba_size(&id_ns)?;
-            println!("lba_shift = {}, lba_size = {}", lba_shift, lba_size);
 
             (Some(nsid), Some(lba_shift), Some(lba_size), Some(id_ns))
         } else {
@@ -823,7 +821,6 @@ impl RawBlockDevice {
             fd_size_bytes(fd)?
         };
 
-        println!("size = {}", size as u64);
         let (
             ring_opt,
             queue_opt,
