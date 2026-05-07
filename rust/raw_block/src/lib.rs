@@ -427,24 +427,28 @@ fn nvme_fdp_reclaim_unit_handle_status(
 ///
 /// Returns a vector of placement identifiers (PIDs) for all available reclaim units
 fn fetch_ruhs(fd: RawFd, nsid: u32, max_ruhs: u16) -> Result<Vec<u16>, PyErr> {
-    // Calculate buffer size needed
     let header_size = std::mem::size_of::<NvmeFdpRuhStatus>();
     let desc_size = std::mem::size_of::<NvmeFdpRuhStatusDesc>();
-    let bytes = header_size + (max_ruhs as usize) * desc_size;
+    let mut header: NvmeFdpRuhStatus = unsafe { std::mem::zeroed() };
 
-    // Allocate buffer for RUH status
+    // Match nvme-cli behavior: first fetch the fixed-size header to determine
+    // how many descriptors the controller reports, then reissue the command
+    // with an exact-sized buffer for the full payload.
+    nvme_fdp_reclaim_unit_handle_status(
+        fd,
+        nsid,
+        header_size as u32,
+        (&mut header as *mut NvmeFdpRuhStatus).cast::<u8>(),
+    )?;
+
+    let nruhsd = u16::from_le(header.nruhsd);
+    let actual_ruhs = std::cmp::min(nruhsd, max_ruhs) as usize;
+    let bytes = header_size + actual_ruhs * desc_size;
+
     let mut buffer: Vec<u8> = vec![0; bytes];
-    let ruhs_ptr = buffer.as_mut_ptr() as *mut NvmeFdpRuhStatus;
-
-    // Send I/O management receive command
     nvme_fdp_reclaim_unit_handle_status(fd, nsid, bytes as u32, buffer.as_mut_ptr())?;
 
-    // Read the number of RUH descriptors returned
-    let nruhsd = unsafe { u16::from_le((*ruhs_ptr).nruhsd) };
-    let actual_ruhs = std::cmp::min(nruhsd, max_ruhs) as usize;
-
-    // Extract placement identifiers from each descriptor
-    let mut plis: Vec<u16> = Vec::with_capacity(actual_ruhs);
+    let ruhs_ptr = buffer.as_ptr() as *const NvmeFdpRuhStatus;
     let desc_array = unsafe {
         std::slice::from_raw_parts(
             (ruhs_ptr as *const u8).add(header_size) as *const NvmeFdpRuhStatusDesc,
@@ -452,6 +456,7 @@ fn fetch_ruhs(fd: RawFd, nsid: u32, max_ruhs: u16) -> Result<Vec<u16>, PyErr> {
         )
     };
 
+    let mut plis: Vec<u16> = Vec::with_capacity(actual_ruhs);
     for desc in desc_array {
         plis.push(u16::from_le(desc.pid));
     }
