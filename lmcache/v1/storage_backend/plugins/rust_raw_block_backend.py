@@ -246,12 +246,21 @@ class RustRawBlockBackend(StoragePluginInterface):
             extra.get("rust_raw_block.use_uring_cmd", False)
         )
 
-        # FDP (Flexible Data Placement) support
-        # When enabled, uses placement identifiers based on CUDA device
+        # FDP (Flexible Data Placement) support.
+        # FDP data writes use a rank-based placement policy.
         self.use_fdp: bool = bool(extra.get("rust_raw_block.use_fdp", False))
+        if self.use_fdp and (not self.use_uring or not self.use_uring_cmd):
+            raise RuntimeError(
+                "rust_raw_block.use_fdp requires rust_raw_block.use_uring and "
+                "rust_raw_block.use_uring_cmd"
+            )
 
-        # Store placement identifiers for FDP device.
-        self._placement_ids: list[int] = []
+        # Configured FDP placement identifier for data writes. A negative value
+        # means no FDP directive, so NVMe uses the default RUH.
+        self._data_placement_id: int = -1
+        # Cached per-request data placement IDs;
+        # extended on demand and reused across writes.
+        self._data_placement_ids_cache: list[int] = []
 
         # Maximum data transfer size for a single I/O request.
         # Default is 0 (no splitting).
@@ -408,9 +417,9 @@ class RustRawBlockBackend(StoragePluginInterface):
         if self.use_uring:
             self._register_paged_buffers()
 
-        # Fetch placement identifiers if FDP is enabled
+        # Configure FDP placement identifiers if FDP is enabled.
         if self.use_fdp and self.use_uring_cmd:
-            self._fetch_placement_ids()
+            self._configure_fdp_placements()
 
         # Load latest checkpoint from device (no JSON fallback).
         self._load_checkpoint_from_device()
@@ -538,60 +547,94 @@ class RustRawBlockBackend(StoragePluginInterface):
                 e,
             )
 
-    def _fetch_placement_ids(self) -> None:
-        """Fetch all available placement identifiers from the NVMe device."""
+    def _configure_fdp_placements(self) -> None:
+        """
+        Configure FDP placement IDs for this backend instance.
+
+        This method:
+        1. Fetches FDP status from the NVMe FDP namespace.
+        2. Applies the default rank-based placement behavior.
+        3. Stores the resolved data placement ID in backend state.
+
+        Checkpoint metadata writes do not use FDP directives due to their distinct
+        lifetimes, using the default RUH.
+
+        Raises:
+            RuntimeError: If FDP is enabled but status cannot be fetched or the
+                namespace does not expose any FDP status descriptors.
+        """
+        fdp_status = self._fetch_fdp_status()
+        placement_ids = [pid for pid, _ruhid in fdp_status]
+        self._data_placement_id = self._assign_fdp_placement_rank_based(placement_ids)
+        logger.info(
+            "RustRawBlockBackend: FDP placement configured data_pid=%d",
+            self._data_placement_id,
+        )
+
+    def _fetch_fdp_status(self) -> list[tuple[int, int]]:
+        """Fetch FDP (placement ID, RUH ID) status from the NVMe FDP namespace."""
         try:
             raw_dev = self._rawdev()
-            placement_ids = raw_dev.fetch_reclaim_unit_handles()
-            self._placement_ids = list(placement_ids)
+            fdp_status = [
+                (int(pid), int(ruhid)) for pid, ruhid in raw_dev.fetch_fdp_status()
+            ]
 
             logger.info(
-                "RustRawBlockBackend: fetched %d placement identifiers for FDP: %s",
-                len(self._placement_ids),
-                self._placement_ids,
+                "RustRawBlockBackend: fetched %d FDP status descriptors "
+                "(pid, ruhid): %s",
+                len(fdp_status),
+                fdp_status,
             )
         except Exception as e:
-            logger.warning(
-                "RustRawBlockBackend: failed to fetch placement identifiers: %s. "
-                "FDP will be disabled.",
-                e,
+            raise RuntimeError(
+                "RustRawBlockBackend: FDP is enabled but failed to fetch FDP "
+                f"status: {e}"
+            ) from e
+        if not fdp_status:
+            raise RuntimeError(
+                "RustRawBlockBackend: FDP is enabled but this namespace does not "
+                "expose any FDP status descriptors"
             )
-            self.use_fdp = False
+        return fdp_status
 
-    def _get_placement_id_for_cuda_device(self) -> int:
+    def _assign_fdp_placement_rank_based(self, placement_ids: list[int]) -> int:
         """
-        Get the placement identifier for the current CUDA device.
+        While a namespace can have multiple assigned placement IDs,
+        this policy simply uses the first placement ID per rank.
 
         Returns:
-            The placement ID for the current CUDA device, or -1 if FDP is disabled
-            or no placement ID is available for this device.
+            Data placement ID for this backend instance.
+        """
+        return placement_ids[0]
+
+    def _get_data_placement_id(self) -> int:
+        """
+        Get the configured FDP placement ID for data writes.
+
+        Returns:
+            The configured data placement ID, or -1 if FDP is disabled.
         """
         if not self.use_fdp:
             return -1
+        return self._data_placement_id
 
-        try:
-            # Get current CUDA device
-            cuda_device = torch.cuda.current_device()
+    def _build_data_placement_ids(self, num_requests: int) -> Optional[list[int]]:
+        """
+        Build placement IDs for a batched data write.
 
-            if cuda_device < len(self._placement_ids):
-                return self._placement_ids[cuda_device]
-            else:
-                logger.warning(
-                    "RustRawBlockBackend: no placement ID available for CUDA device %d "
-                    "(available: %s). Using default placement.",
-                    cuda_device,
-                    self._placement_ids,
-                )
-                # Use the first placement ID as fallback
-                if self._placement_ids:
-                    return self._placement_ids[0]
-                return -1
-        except Exception as e:
-            logger.warning(
-                "RustRawBlockBackend: failed to get placement ID for CUDA device: %s",
-                e,
+        Returns:
+            A list containing the same data placement ID for every request when
+            FDP is enabled, otherwise None so writes use the default RUH.
+        """
+        placement_id = self._get_data_placement_id()
+        if placement_id < 0:
+            return None
+        cached = len(self._data_placement_ids_cache)
+        if cached < num_requests:
+            self._data_placement_ids_cache.extend(
+                [placement_id] * (num_requests - cached)
             )
-            return -1
+        return self._data_placement_ids_cache[:num_requests]
 
     def _build_direct_odirect_view(
         self,
@@ -901,10 +944,6 @@ class RustRawBlockBackend(StoragePluginInterface):
             offsets = []
             buffers = []
             total_lens = []
-            placement_ids = []
-
-            # Get placement ID for current CUDA device if FDP is enabled
-            placement_id = self._get_placement_id_for_cuda_device()
 
             for key, offset, header, obj in write_requests:
                 # Prepare payload with proper O_DIRECT alignment and zero-copy handling.
@@ -941,7 +980,6 @@ class RustRawBlockBackend(StoragePluginInterface):
                     offsets.append(offset)
                     buffers.append(header_bytes)
                     total_lens.append(hdr_total)
-                    placement_ids.append(placement_id)
 
                     # Add each payload chunk
                     for chunk_offset, chunk_len in payload_sub_requests:
@@ -951,23 +989,21 @@ class RustRawBlockBackend(StoragePluginInterface):
                         offsets.append(chunk_offset)
                         buffers.append(chunk_buf)
                         total_lens.append(chunk_len)
-                        placement_ids.append(placement_id)
                 else:
                     # No splitting needed
                     offsets.append(offset)
                     buffers.append(header_bytes)
                     total_lens.append(hdr_total)
-                    placement_ids.append(placement_id)
 
                     offsets.append(offset + self.header_bytes)
                     buffers.append(buf)
                     total_lens.append(total_len)
-                    placement_ids.append(placement_id)
 
                 with self._lock:
                     self._inflight_io_count += 1
                 successfully_submitted.append(key)
 
+            placement_ids = self._build_data_placement_ids(len(offsets))
             batch_id = raw_dev.batched_write(
                 offsets, buffers, total_lens, placement_ids
             )
@@ -1756,11 +1792,6 @@ class RustRawBlockBackend(StoragePluginInterface):
 
         raw = self._rawdev()
 
-        # Get placement ID for metadata writes
-        # As of now we use last placement ID from list
-        if self.use_fdp:
-            metadata_placement_id = self._placement_ids[-1]
-
         if self.use_uring:
             # Check if we need to split the metadata write
             if (
@@ -1784,7 +1815,6 @@ class RustRawBlockBackend(StoragePluginInterface):
                         chunk_buf,
                         chunk_payload,
                         chunk_len,
-                        metadata_placement_id,
                     )
                     buffer_offset += chunk_len
             else:
@@ -1793,7 +1823,6 @@ class RustRawBlockBackend(StoragePluginInterface):
                     payload,
                     payload_len,
                     payload_total_len,
-                    metadata_placement_id,
                 )
             raw.write_uring(target, header_block, self.block_align, self.block_align)
         else:

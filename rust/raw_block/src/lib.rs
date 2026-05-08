@@ -423,10 +423,10 @@ fn nvme_fdp_reclaim_unit_handle_status(
     Ok(())
 }
 
-/// Fetch all available reclaim unit handles (RUH) for the NVMe device
+/// Fetch FDP status descriptors for the NVMe namespace.
 ///
-/// Returns a vector of placement identifiers (PIDs) for all available reclaim units
-fn fetch_ruhs(fd: RawFd, nsid: u32, max_ruhs: u16) -> Result<Vec<u16>, PyErr> {
+/// Returns a vector of (placement identifier, reclaim unit handle identifier).
+fn fetch_fdp_status(fd: RawFd, nsid: u32, max_ruhs: u16) -> Result<Vec<(u16, u16)>, PyErr> {
     let header_size = std::mem::size_of::<NvmeFdpRuhStatus>();
     let desc_size = std::mem::size_of::<NvmeFdpRuhStatusDesc>();
     let mut header: NvmeFdpRuhStatus = unsafe { std::mem::zeroed() };
@@ -449,6 +449,7 @@ fn fetch_ruhs(fd: RawFd, nsid: u32, max_ruhs: u16) -> Result<Vec<u16>, PyErr> {
     nvme_fdp_reclaim_unit_handle_status(fd, nsid, bytes as u32, buffer.as_mut_ptr())?;
 
     let ruhs_ptr = buffer.as_ptr() as *const NvmeFdpRuhStatus;
+    let mut status: Vec<(u16, u16)> = Vec::with_capacity(actual_ruhs);
     let desc_array = unsafe {
         std::slice::from_raw_parts(
             (ruhs_ptr as *const u8).add(header_size) as *const NvmeFdpRuhStatusDesc,
@@ -456,12 +457,11 @@ fn fetch_ruhs(fd: RawFd, nsid: u32, max_ruhs: u16) -> Result<Vec<u16>, PyErr> {
         )
     };
 
-    let mut plis: Vec<u16> = Vec::with_capacity(actual_ruhs);
     for desc in desc_array {
-        plis.push(u16::from_le(desc.pid));
+        status.push((u16::from_le(desc.pid), u16::from_le(desc.ruhid)));
     }
 
-    Ok(plis)
+    Ok(status)
 }
 
 /// Prepare NVMe uring command for read/write operations
@@ -1550,26 +1550,25 @@ impl RawBlockDevice {
         })
     }
 
-    /// Fetch all available reclaim unit handles (RUH) for the NVMe device
+    /// Fetch FDP status descriptors for the NVMe namespace.
     ///
     /// This function sends an NVMe I/O Management Receive command to retrieve
-    /// the status of all reclaim unit handles. It returns a list of placement
-    /// identifiers (PIDs) that can be used for FDP (Flexible Data Placement)
-    /// operations.
+    /// the status of all reclaim unit handles, including their placement
+    /// identifiers (PIDs) for FDP (Flexible Data Placement) operations.
     ///
     /// Args:
     ///     max_ruhs: Maximum number of reclaim unit handles to fetch (default: 256)
     ///
     /// Returns:
-    ///     A list of placement identifiers (u16) for each available reclaim unit
+    ///     A list of (placement identifier, reclaim unit handle identifier) tuples.
     ///
     /// Raises:
     ///     PyRuntimeError: If use_uring_cmd is not enabled or the command fails
     #[pyo3(signature = (max_ruhs = 256))]
-    fn fetch_reclaim_unit_handles(&self, max_ruhs: u16) -> PyResult<Vec<u16>> {
+    fn fetch_fdp_status(&self, max_ruhs: u16) -> PyResult<Vec<(u16, u16)>> {
         if !self.use_uring_cmd {
             return Err(PyRuntimeError::new_err(
-                "fetch_reclaim_unit_handles requires use_uring_cmd to be enabled",
+                "fetch_fdp_status requires use_uring_cmd to be enabled",
             ));
         }
 
@@ -1577,7 +1576,7 @@ impl RawBlockDevice {
             .nvme_nsid
             .ok_or_else(|| PyRuntimeError::new_err("NVMe namespace ID not available"))?;
 
-        fetch_ruhs(self.fd, nsid, max_ruhs)
+        fetch_fdp_status(self.fd, nsid, max_ruhs)
     }
 
     /// Register fixed buffers for zero-copy io_uring operations.
