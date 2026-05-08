@@ -3,9 +3,9 @@
 """Tests for io_uring command (passthrough) support in Rust raw block backend."""
 
 # Standard
+from unittest.mock import MagicMock, patch
 import asyncio
 import os
-import threading
 
 # Third Party
 import pytest
@@ -22,13 +22,9 @@ logger = init_logger(__name__)
 @pytest.fixture
 def loop_in_thread():
     loop = asyncio.new_event_loop()
-    t = threading.Thread(target=loop.run_forever, name="test-loop", daemon=True)
-    t.start()
     try:
         yield loop
     finally:
-        loop.call_soon_threadsafe(loop.stop)
-        t.join(timeout=5)
         loop.close()
 
 
@@ -143,15 +139,23 @@ def test_uring_cmd_disabled(loop_in_thread):
     config = MockConfig(device_path="/dev/null", use_uring_cmd=False)
     metadata = MockMetadata(worker_id=0, world_size=1)
     local_cpu_backend = MockLocalCPUBackend()
+    raw_device = MagicMock()
+    raw_device.nvme_nsid.side_effect = RuntimeError("use_uring_cmd not enabled")
+    raw_device.nvme_lba_size.side_effect = RuntimeError("use_uring_cmd not enabled")
 
-    backend = RustRawBlockBackend(
-        config=config,
-        metadata=metadata,
-        local_cpu_backend=local_cpu_backend,
-        loop=loop_in_thread,
-    )
-
-    raw_device = backend._rawdev()
+    with (
+        patch.object(RustRawBlockBackend, "_rawdev", return_value=raw_device),
+        patch.object(RustRawBlockBackend, "_ensure_capacity_and_layout"),
+        patch.object(RustRawBlockBackend, "_register_paged_buffers"),
+        patch.object(RustRawBlockBackend, "_load_checkpoint_from_device"),
+    ):
+        backend = RustRawBlockBackend(
+            config=config,
+            metadata=metadata,
+            local_cpu_backend=local_cpu_backend,
+            loop=loop_in_thread,
+        )
+        backend._raw = raw_device
 
     # These should raise errors when use_uring_cmd is disabled
     with pytest.raises(RuntimeError, match="use_uring_cmd not enabled"):
