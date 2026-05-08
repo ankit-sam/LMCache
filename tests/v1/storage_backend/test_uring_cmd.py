@@ -15,6 +15,7 @@ from lmcache.logging import init_logger
 from lmcache.v1.storage_backend.plugins.rust_raw_block_backend import (
     RustRawBlockBackend,
 )
+import lmcache.v1.storage_backend.plugins.rust_raw_block_backend as raw_block_backend
 
 logger = init_logger(__name__)
 
@@ -69,6 +70,37 @@ class MockLocalCPUBackend:
     def get_full_chunk_size_bytes(self) -> int:
         """return a default chunk size only for testing."""
         return 256 * 1024
+
+
+def _build_transfer_limit_backend(
+    dev_path: str,
+    max_data_transfer_size: int | None = None,
+) -> RustRawBlockBackend:
+    config = MockConfig(device_path=dev_path, use_uring_cmd=False)
+    if max_data_transfer_size is not None:
+        config.extra_config["rust_raw_block.max_data_transfer_size"] = (
+            max_data_transfer_size
+        )
+
+    metadata = MockMetadata()
+    loop = asyncio.new_event_loop()
+    try:
+        with (
+            patch.object(RustRawBlockBackend, "_rawdev", return_value=MagicMock()),
+            patch.object(RustRawBlockBackend, "_ensure_capacity_and_layout"),
+            patch.object(RustRawBlockBackend, "_register_paged_buffers"),
+            patch.object(RustRawBlockBackend, "_load_checkpoint_from_device"),
+        ):
+            backend = RustRawBlockBackend(
+                config=config,
+                metadata=metadata,
+                local_cpu_backend=MockLocalCPUBackend(),
+                loop=loop,
+                dst_device="cpu",
+            )
+            return backend
+    finally:
+        loop.close()
 
 
 def test_uring_cmd_requires_character_device(loop_in_thread):
@@ -163,6 +195,62 @@ def test_uring_cmd_disabled(loop_in_thread):
 
     with pytest.raises(RuntimeError, match="use_uring_cmd not enabled"):
         raw_device.nvme_lba_size()
+
+
+def test_uring_cmd_auto_transfer_limit_from_sysfs_ng_device():
+    expected_path = "/sys/block/nvme0n1/queue/max_hw_sectors_kb"
+    with patch.object(
+        raw_block_backend,
+        "_read_sysfs_int",
+        return_value=1024,
+    ) as mock_read:
+        backend = _build_transfer_limit_backend("/dev/ng0n1", max_data_transfer_size=-1)
+
+    mock_read.assert_called_once_with(expected_path)
+    assert backend.max_data_transfer_size == 1024 * 1024
+
+
+def test_uring_cmd_auto_transfer_limit_fails_when_sysfs_unavailable():
+    expected_path = "/sys/block/nvme0n1/queue/max_hw_sectors_kb"
+    with patch.object(
+        raw_block_backend, "_read_sysfs_int", return_value=None
+    ) as mock_read:
+        with pytest.raises(RuntimeError, match="failed to read max_hw_sectors_kb"):
+            _build_transfer_limit_backend("/dev/ng0n1", max_data_transfer_size=-1)
+
+    mock_read.assert_called_once_with(expected_path)
+
+
+def test_uring_cmd_auto_transfer_limit_rejects_unsupported_device_path():
+    with patch.object(raw_block_backend, "_read_sysfs_int") as mock_read:
+        with pytest.raises(
+            RuntimeError, match="unable to derive NVMe sysfs queue path"
+        ):
+            _build_transfer_limit_backend("/dev/nvme0n1", max_data_transfer_size=-1)
+
+    mock_read.assert_not_called()
+
+
+def test_uring_cmd_auto_transfer_limit_rejects_file_path():
+    with patch.object(raw_block_backend, "_read_sysfs_int") as mock_read:
+        with pytest.raises(
+            RuntimeError, match="unable to derive NVMe sysfs queue path"
+        ):
+            _build_transfer_limit_backend("/tmp/dev.bin", max_data_transfer_size=-1)
+
+    mock_read.assert_not_called()
+
+
+def test_uring_cmd_no_split_when_transfer_limit_is_zero():
+    backend = _build_transfer_limit_backend("/dev/ng0n1", max_data_transfer_size=0)
+    assert backend.max_data_transfer_size == 0
+
+
+def test_uring_cmd_rejects_invalid_negative_transfer_limit():
+    with pytest.raises(
+        ValueError, match="max_data_transfer_size must be -1, 0, or > 0"
+    ):
+        _build_transfer_limit_backend("/dev/ng0n1", max_data_transfer_size=-2)
 
 
 if __name__ == "__main__":

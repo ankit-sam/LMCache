@@ -11,6 +11,8 @@ from typing import Any, Callable, List, Optional, Sequence
 import asyncio
 import ctypes
 import json
+import os
+import re
 import struct
 import threading
 import time
@@ -80,6 +82,25 @@ def _split_large_request(
         remaining -= chunk_len
 
     return sub_requests
+
+
+def _resolve_sysfs_queue_dir(device_path: str) -> Optional[str]:
+    """Resolve sysfs queue directory for NVMe character device paths."""
+    base_name = os.path.basename(device_path)
+    match = re.fullmatch(r"ng(\d+)n(\d+)", base_name)
+    if match:
+        ctrl, nsid = match.groups()
+        return f"/sys/block/nvme{ctrl}n{nsid}/queue"
+    return None
+
+
+def _read_sysfs_int(path: str) -> Optional[int]:
+    """Read an integer value from sysfs and return None on failure."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
 
 
 def _validate_per_tp_device_paths(per_tp_devices: PerTPDevicePaths) -> None:
@@ -232,11 +253,16 @@ class RustRawBlockBackend(StoragePluginInterface):
         # Store placement identifiers for FDP device.
         self._placement_ids: list[int] = []
 
-        # Maximum data transfer size for a single I/O request
-        # Requests larger than this will be split into multiple smaller requests
-        # Default: 0 (no splitting)
-        self.max_data_transfer_size: int = int(
+        # Maximum data transfer size for a single I/O request.
+        # Default is 0 (no splitting).
+        # > 0: explicit manual split size
+        #   0: no splitting
+        #  -1: opt-in auto-detect from device queue limits
+        configured_max_transfer = int(
             extra.get("rust_raw_block.max_data_transfer_size", 0)
+        )
+        self.max_data_transfer_size: int = self._resolve_max_data_transfer_size(
+            configured_max_transfer
         )
 
         # On-device metadata region config.
@@ -414,6 +440,44 @@ class RustRawBlockBackend(StoragePluginInterface):
 
     def __str__(self) -> str:
         return "RustRawBlockBackend"
+
+    def _resolve_max_data_transfer_size(self, configured_size: int) -> int:
+        """Resolve transfer split size from config or NVMe sysfs queue limits."""
+        if configured_size >= 0:
+            return configured_size
+        if configured_size != -1:
+            raise ValueError(
+                "rust_raw_block.max_data_transfer_size must be -1, 0, or > 0"
+            )
+
+        queue_dir = _resolve_sysfs_queue_dir(self.device_path)
+        if queue_dir is None:
+            raise RuntimeError(
+                "RustRawBlockBackend: unable to derive NVMe sysfs queue path from "
+                "NVMe character device path "
+                f"{self.device_path} for auto max_data_transfer_size"
+            )
+
+        max_hw_sectors_kb = _read_sysfs_int(f"{queue_dir}/max_hw_sectors_kb")
+        if max_hw_sectors_kb is None or max_hw_sectors_kb <= 0:
+            raise RuntimeError(
+                "RustRawBlockBackend: failed to read max_hw_sectors_kb from "
+                f"{queue_dir} for auto max_data_transfer_size"
+            )
+
+        resolved_bytes = max_hw_sectors_kb * 1024
+        aligned_bytes = (resolved_bytes // self.block_align) * self.block_align
+        if aligned_bytes <= 0:
+            aligned_bytes = self.block_align
+
+        logger.info(
+            "RustRawBlockBackend: auto max_data_transfer_size=%d bytes "
+            "(device=%s, max_hw_sectors_kb=%s)",
+            aligned_bytes,
+            self.device_path,
+            max_hw_sectors_kb,
+        )
+        return aligned_bytes
 
     def _rawdev(self):
         if self._raw is None:
